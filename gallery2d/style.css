@@ -1,13 +1,5 @@
 * { box-sizing: border-box; }
 
-@font-face {
-  font-family: 'Basote';
-  src: url('/fonts/Basote.ttf') format('truetype');
-  font-weight: normal;
-  font-style: normal;
-  font-display: swap;
-}
-
 body {
   margin: 0;
   font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
@@ -291,6 +283,14 @@ footer {
 }
 
 .footer-row .credit a:hover { color: #fff; border-bottom-color: #fff; }
+
+.footer-row .source-link {
+  display: inline-flex;
+  align-items: center;
+  color: #aaa;
+  transition: color 0.15s ease;
+}
+.footer-row .source-link:hover { color: #fff; }
 
 #spinner {
   position: fixed;

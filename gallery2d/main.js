@@ -122,7 +122,9 @@ let isLoading = false;
 
 form.addEventListener('submit', (e) => {
   e.preventDefault();
-  const handle = handleInput.value.trim().replace(/^@/, '');
+  // Empty input → use the data-default suggestion.
+  const raw = handleInput.value.trim() || handleInput.dataset.default || '';
+  const handle = raw.trim().replace(/^@/, '');
   if (!handle) return;
   currentActor = handle;
   cursor = null;
@@ -132,9 +134,7 @@ form.addEventListener('submit', (e) => {
   loadPage(true);
 });
 
-moreBtn.addEventListener('click', () => loadPage(false));
-
-// Infinite scroll: auto-load when the "Load more" button enters the viewport
+// Infinite scroll: auto-load when the bottom sentinel enters the viewport
 const moreObserver = new IntersectionObserver((entries) => {
   for (const entry of entries) {
     if (entry.isIntersecting && cursor && !isLoading) {
