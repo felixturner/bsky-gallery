@@ -120,19 +120,63 @@ const rawItems = []; // raw feed items from API, append-only
 let renderedCount = 0; // index into rawItems of how many have been rendered
 let isLoading = false;
 
-form.addEventListener('submit', (e) => {
-  e.preventDefault();
-  // Empty input → use the data-default suggestion.
-  const raw = handleInput.value.trim() || handleInput.dataset.default || '';
-  const handle = raw.trim().replace(/^@/, '');
+function startFeedFor(handle, { pushUrl = true } = {}) {
   if (!handle) return;
+  if (pushUrl) {
+    const url = new URL(window.location);
+    url.searchParams.set('handle', handle);
+    history.pushState({ handle }, '', url);
+  }
   currentActor = handle;
   cursor = null;
   rawItems.length = 0;
   renderedCount = 0;
   moreBtn.hidden = true;
+  // Clear the gallery before fetching so a failed lookup doesn't leave the
+  // previous handle's media on screen behind the error message.
+  for (const v of feedEl.querySelectorAll('.video-thumb video')) {
+    videoVisibilityObserver.unobserve(v);
+    detachHls(v);
+  }
+  feedEl.innerHTML = '';
+  feedEl.style.height = '';
+  setStatus('');
   loadPage(true);
+}
+
+function normalizeHandle(input) {
+  const s = (input || '').trim();
+  // Pasted profile URL → pull out the handle
+  const m = s.match(/bsky\.app\/profile\/([^\/?#]+)/i);
+  if (m) return m[1];
+  return s.replace(/^@/, '');
+}
+
+form.addEventListener('submit', (e) => {
+  e.preventDefault();
+  // Empty input → use the data-default suggestion.
+  const raw = handleInput.value.trim() || handleInput.dataset.default || '';
+  const handle = normalizeHandle(raw);
+  // Reflect the cleaned handle back into the input box.
+  handleInput.value = handle;
+  startFeedFor(handle);
 });
+
+// Browser back/forward → reload feed for the previous handle
+window.addEventListener('popstate', () => {
+  const handle = new URL(window.location).searchParams.get('handle') || '';
+  handleInput.value = handle;
+  if (handle) startFeedFor(handle, { pushUrl: false });
+});
+
+// On first load, honor ?handle=… in the URL so links are shareable.
+(() => {
+  const initial = new URL(window.location).searchParams.get('handle');
+  if (initial) {
+    handleInput.value = initial;
+    startFeedFor(initial, { pushUrl: false });
+  }
+})();
 
 // Infinite scroll: auto-load when the bottom sentinel enters the viewport
 const moreObserver = new IntersectionObserver((entries) => {
@@ -159,7 +203,15 @@ async function loadPage(isInitial) {
       if (cursor) url.searchParams.set('cursor', cursor);
 
       const res = await fetch(url);
-      if (!res.ok) throw new Error(`${res.status}: ${await res.text()}`);
+      if (!res.ok) {
+        const body = await res.text();
+        // Bluesky returns 400 with { error: "InvalidRequest", message: "Profile not found" }
+        // (or "Actor not found") for unknown handles. Surface a clean message.
+        if (res.status === 400 && /not found|could not find/i.test(body)) {
+          throw new Error('PROFILE_NOT_FOUND');
+        }
+        throw new Error(`${res.status}: ${body}`);
+      }
       const data = await res.json();
       cursor = data.cursor || null;
 
@@ -181,17 +233,22 @@ async function loadPage(isInitial) {
     moreBtn.hidden = !cursor;
     moreBtn.disabled = false;
   } catch (err) {
-    console.error(err);
-    setStatus(`Error: ${err.message}`, true);
+    if (err.message === 'PROFILE_NOT_FOUND') {
+      setStatus('Bluesky profile not found', 'notice');
+    } else {
+      console.error(err);
+      setStatus(`Error: ${err.message}`, 'error');
+    }
     moreBtn.disabled = false;
   } finally {
     isLoading = false;
   }
 }
 
-function setStatus(msg, isError = false) {
+function setStatus(msg, kind) {
   statusEl.textContent = msg;
-  statusEl.classList.toggle('error', isError);
+  statusEl.classList.toggle('error', kind === 'error');
+  statusEl.classList.toggle('notice', kind === 'notice');
 }
 
 function postUrl(post) {

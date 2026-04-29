@@ -136,6 +136,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 
 #status:empty { display: none; }
 #status.error { color: #ff6b6b; }
+#status.notice { color: #fff; font-size: 1rem; }
 
 main {
   padding: 1rem;
