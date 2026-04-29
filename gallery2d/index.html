@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Bluesky Media Gallery</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Fraunces:opsz,wght@9..144,400;9..144,600;9..144,800&display=swap" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Bluesky Media Gallery</h1>
+      <form id="form">
+        <input id="handle" type="text" list="handle-suggestions" placeholder="bluesky handle" autocomplete="off" required />
+        <datalist id="handle-suggestions">
+          <option value="felixturner.bsky.social"></option>
+        </datalist>
+        <button type="submit">Go</button>
+      </form>
+      <div class="footer-row">
+        <label class="check-label">
+          <input type="checkbox" id="reposts" checked />
+          <span class="check-icon">
+            <svg class="check-off" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect width="18" height="18" x="3" y="3" rx="2"/>
+            </svg>
+            <svg class="check-on" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect width="18" height="18" x="3" y="3" rx="2"/>
+              <path d="m9 12 2 2 4-4"/>
+            </svg>
+          </span>
+          Show Reposts
+        </label>
+        <span class="credit">Built by <a href="https://airtight.cc" target="_blank" rel="noopener">Airtight</a></span>
+      </div>
+      <div id="toggles">
+        <label><input type="checkbox" id="external" /> external embeds</label>
+        <label><input type="checkbox" id="linked" /> linked media</label>
+        <label><input type="checkbox" id="masonry-layout" checked /> L→R masonry</label>
+      </div>
+    </header>
+    <div id="spinner" hidden><div class="ring"></div></div>
+    <main id="feed">
+      <div class="grid-sizer"></div>
+      <div class="gutter-sizer"></div>
+    </main>
+    <footer>
+      <button id="more" hidden>Load more</button>
+      <div id="status"></div>
+    </footer>
+    <div id="lightbox" hidden>
+      <button id="lightbox-close" aria-label="Close">
+        <svg viewBox="0 0 24 24" width="27" height="27" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"/>
+          <line x1="6" y1="6" x2="18" y2="18"/>
+        </svg>
+      </button>
+      <div id="lightbox-content"></div>
+    </div>
+    <script type="module" src="/main.js"></script>
+  </body>
+</html>

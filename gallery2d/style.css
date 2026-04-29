@@ -1,0 +1,397 @@
+* { box-sizing: border-box; }
+
+@font-face {
+  font-family: 'Basote';
+  src: url('/fonts/Basote.ttf') format('truetype');
+  font-weight: normal;
+  font-style: normal;
+  font-display: swap;
+}
+
+body {
+  margin: 0;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  background: #111;
+  color: #eee;
+  min-height: 100vh;
+}
+
+header {
+  padding: 2rem 1rem;
+  text-align: center;
+}
+
+h1 {
+  margin: 0 0 1.5rem;
+  font-family: 'Fraunces', Georgia, serif;
+  font-size: 3.08rem;
+  font-weight: normal;
+  letter-spacing: 0.02em;
+}
+
+#form {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+  max-width: 480px;
+  margin: 0 auto;
+}
+
+#handle {
+  flex: 1;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid #222;
+  border-radius: 6px;
+  background: #222;
+  color: inherit;
+  font-size: 0.95rem;
+}
+
+#handle:focus { outline: none; border-color: #888; }
+
+button {
+  padding: 0.55rem 1.4rem;
+  border: 1px solid #fff;
+  border-radius: 999px;
+  background: transparent;
+  color: #fff;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  font-size: 0.9rem;
+  letter-spacing: 0.04em;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+
+button:hover { background: #fff; color: #111; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* Minimal B/W checkbox */
+#toggles input[type="checkbox"] {
+  appearance: none;
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  border: 1px solid #888;
+  border-radius: 3px;
+  background: transparent;
+  cursor: pointer;
+  position: relative;
+  vertical-align: middle;
+  margin-right: 0.4rem;
+  transition: background 0.1s, border-color 0.1s;
+}
+
+#toggles input[type="checkbox"]:hover { border-color: #fff; }
+
+#toggles input[type="checkbox"]:checked {
+  background: #fff;
+  border-color: #fff;
+}
+
+#toggles input[type="checkbox"]:checked::after {
+  content: '';
+  position: absolute;
+  left: 3px;
+  top: 0;
+  width: 5px;
+  height: 9px;
+  border: solid #111;
+  border-width: 0 2px 2px 0;
+  transform: rotate(45deg);
+}
+
+#toggles {
+  display: none;            /* dev-only toggles hidden; reposts is in the footer-row */
+  flex-wrap: wrap;
+  gap: 0.4rem 1.5rem;
+  justify-content: center;
+  margin-top: 1rem;
+}
+
+/* Lucide-icon checkbox label used in the footer-row */
+.check-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  cursor: pointer;
+  color: #888;
+  user-select: none;
+  transition: color 0.15s ease;
+}
+.check-label:hover { color: #fff; }
+.check-label input { position: absolute; opacity: 0; pointer-events: none; }
+.check-icon { display: inline-flex; align-items: center; }
+.check-label .check-on { display: none; }
+.check-label input:checked ~ .check-icon .check-off { display: none; }
+.check-label input:checked ~ .check-icon .check-on { display: inline; }
+
+#toggles label {
+  font-size: 0.85rem;
+  color: #888;
+  cursor: pointer;
+  user-select: none;
+}
+
+#status {
+  font-size: 0.8rem;
+  color: #888;
+  text-align: center;
+  letter-spacing: 0.04em;
+  margin-top: 1rem;
+}
+
+#status:empty { display: none; }
+#status.error { color: #ff6b6b; }
+
+main {
+  padding: 1rem;
+  position: relative;
+}
+
+.item {
+  margin-bottom: 0.5rem;
+  border-radius: 8px;
+  overflow: hidden;
+  background: #222;
+  border: 1px solid #222;
+  position: relative;
+}
+
+/* Top-down columns mode (default, fast, native) */
+body:not(.layout-masonry) main {
+  column-count: 5;
+  column-gap: 0.5rem;
+}
+body:not(.layout-masonry) .item { break-inside: avoid; display: block; }
+
+@media (max-width: 1600px) { body:not(.layout-masonry) main { column-count: 4; } }
+@media (max-width: 1200px) { body:not(.layout-masonry) main { column-count: 3; } }
+@media (max-width: 800px)  { body:not(.layout-masonry) main { column-count: 2; } }
+@media (max-width: 500px)  { body:not(.layout-masonry) main { column-count: 1; } }
+
+/* L→R masonry mode is done in JS — items get inline width/left/top set there */
+
+.item img,
+.item video,
+.item iframe {
+  width: 100%;
+  height: auto;
+  display: block;
+}
+
+.video-thumb {
+  position: relative;
+  width: 100%;
+  cursor: pointer;
+  background: #222;
+}
+
+.video-thumb img,
+.video-thumb video {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.play-overlay {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  transition: transform 0.15s ease;
+}
+
+.play-overlay svg circle { transition: fill 0.15s ease; }
+.video-thumb:hover .play-overlay { transform: scale(1.06); }
+.video-thumb:hover .play-overlay svg circle { fill: rgba(0,0,0,0.75); }
+
+.item iframe {
+  aspect-ratio: 16 / 9;
+  border: 0;
+}
+
+.item .meta {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  padding: 0.5rem 0.75rem;
+  font-size: 0.78rem;
+  color: #eee;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 0.5rem;
+  background: linear-gradient(to top, rgba(0,0,0,0.55), rgba(0,0,0,0));
+  pointer-events: none;
+  z-index: 2;
+}
+
+.item .meta a {
+  color: #fff;
+  text-decoration: none;
+  display: inline-flex;
+  align-items: center;
+  pointer-events: auto;
+  padding: 2px;
+  border-radius: 4px;
+}
+
+.item .meta a:hover { background: rgba(255,255,255,0.15); }
+.item .meta .date { text-shadow: 0 1px 2px rgba(0,0,0,0.6); }
+
+.item .alt {
+  padding: 0.4rem 0.75rem 0;
+  font-size: 0.78rem;
+  color: #666;
+  font-style: italic;
+}
+
+footer {
+  padding: 1.5rem 1rem 2rem;
+  text-align: center;
+}
+
+.footer-row {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 1.2rem;
+  margin-top: 1.5rem;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+}
+
+.footer-row .credit {
+  color: #666;
+  position: relative;
+}
+
+/* Centered 1px divider that sits exactly in the middle of the row's gap */
+.footer-row .credit::before {
+  content: '';
+  position: absolute;
+  left: calc(-1.2rem / 2 - 0.5px);   /* gap is 1.2rem; line is 1px wide */
+  top: 50%;
+  transform: translateY(-50%);
+  width: 1px;
+  height: 1em;
+  background: #444;
+}
+
+.footer-row .credit a {
+  color: #aaa;
+  text-decoration: none;
+  border-bottom: 1px solid #444;
+  transition: color 0.15s ease, border-color 0.15s ease;
+}
+
+.footer-row .credit a:hover { color: #fff; border-bottom-color: #fff; }
+
+#spinner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  width: 100vw;
+  height: 100vh;
+  display: none;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(2px);
+  z-index: 100;
+  pointer-events: none;
+}
+
+body.resizing #spinner { display: flex; }
+body.resizing main .item { visibility: hidden; }
+
+.ring {
+  width: 36px;
+  height: 36px;
+  border: 3px solid rgba(255, 255, 255, 0.2);
+  border-top-color: rgba(255, 255, 255, 0.9);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+#lightbox {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.92);
+  z-index: 200;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  cursor: zoom-out;
+}
+
+#lightbox[hidden] { display: none; }
+
+#lightbox-content {
+  max-width: 100%;
+  max-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.lightbox-frame {
+  position: relative;
+  max-width: calc(100vw - 2rem);
+  max-height: calc(100vh - 2rem);
+  background: #222;
+  border-radius: 4px;
+  cursor: default;
+}
+
+.lightbox-frame .ring {
+  position: absolute;
+  top: calc(50% - 18px);
+  left: calc(50% - 18px);
+}
+
+.lightbox-media {
+  display: block;
+  border: 0;
+  border-radius: 4px;
+  opacity: 0;
+  transition: opacity 0.2s ease;
+}
+
+.lightbox-media.fill {
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+.lightbox-media.loaded { opacity: 1; }
+
+#lightbox-close {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  width: 54px;
+  height: 54px;
+  border: 0;
+  border-radius: 50%;
+  background: rgba(0, 0, 0, 0.5);
+  color: #fff;
+  font-size: 1.4rem;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  z-index: 1;
+}
+
+#lightbox-close:hover { background: rgba(0, 0, 0, 0.75); }

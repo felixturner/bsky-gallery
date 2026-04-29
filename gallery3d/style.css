@@ -1,0 +1,74 @@
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #111; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+
+canvas { display: block; }
+
+#status,
+#info {
+  position: fixed;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.5);
+  pointer-events: none;
+  z-index: 10;
+  letter-spacing: 0.02em;
+}
+
+#status { top: 1rem; left: 1rem; }
+#status[hidden] { display: none; }
+
+#info { bottom: 1rem; left: 1rem; color: #aaa; }
+
+#esc-hint {
+  position: fixed;
+  bottom: 1rem;
+  right: 1rem;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  color: #aaa;
+  background: rgba(0, 0, 0, 0.5);
+  border-radius: 4px;
+  pointer-events: none;
+  z-index: 10;
+  letter-spacing: 0.02em;
+}
+
+#overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.6);
+  backdrop-filter: blur(4px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  cursor: pointer;
+}
+#overlay[hidden] { display: none; }
+
+#overlay .panel {
+  text-align: center;
+  padding: 2rem 2.5rem;
+  border: 1px solid #333;
+  border-radius: 8px;
+  background: rgba(0, 0, 0, 0.4);
+}
+#overlay h1 { margin: 0 0 1rem; font-weight: 600; font-size: 1.4rem; letter-spacing: 0.02em; }
+#overlay p { margin: 0.4rem 0; color: #ccc; font-size: 0.95rem; }
+#overlay .hint { color: #888; font-size: 0.78rem; margin-top: 1rem; }
+
+#reticle {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  width: 4px;
+  height: 4px;
+  background: #fff;
+  border-radius: 50%;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  z-index: 5;
+  opacity: 0.7;
+  mix-blend-mode: difference;
+}
