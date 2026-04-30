@@ -1,7 +1,12 @@
 import Hls from 'hls.js';
 import imagesLoaded from 'imagesloaded';
 
-const API = 'https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed';
+const XRPC = 'https://public.api.bsky.app/xrpc';
+const ENDPOINT = {
+  handle: { path: 'app.bsky.feed.getAuthorFeed', param: 'actor' },
+  feed:   { path: 'app.bsky.feed.getFeed',       param: 'feed'  },
+  list:   { path: 'app.bsky.feed.getListFeed',   param: 'list'  },
+};
 const PAGE_SIZE = 50;
 
 const form = document.getElementById('form');
@@ -114,26 +119,73 @@ window.addEventListener('resize', () => {
   }, 200);
 });
 
-let currentActor = null;
+let currentSource = null; // { type: 'handle'|'feed'|'list', uri: string }
 let cursor = null;
 const rawItems = []; // raw feed items from API, append-only
 let renderedCount = 0; // index into rawItems of how many have been rendered
 let isLoading = false;
 
-function startFeedFor(handle, { pushUrl = true } = {}) {
-  if (!handle) return;
+// Parse user input into a structured source descriptor.
+// Accepts plain handles, profile URLs, feed URLs, list URLs, and AT-URIs.
+function parseSource(input) {
+  const s = (input || '').trim();
+
+  // bsky.app feed URL
+  let m = s.match(/bsky\.app\/profile\/([^\/]+)\/feed\/([^\/?#]+)/i);
+  if (m) return { type: 'feed', handle: m[1], rkey: m[2] };
+
+  // bsky.app list URL
+  m = s.match(/bsky\.app\/profile\/([^\/]+)\/lists\/([^\/?#]+)/i);
+  if (m) return { type: 'list', handle: m[1], rkey: m[2] };
+
+  // bsky.app profile URL → just the handle
+  m = s.match(/bsky\.app\/profile\/([^\/?#]+)/i);
+  if (m) return { type: 'handle', actor: m[1] };
+
+  // AT-URI
+  if (s.startsWith('at://')) {
+    if (s.includes('/app.bsky.feed.generator/')) return { type: 'feed', uri: s };
+    if (s.includes('/app.bsky.graph.list/'))     return { type: 'list', uri: s };
+  }
+
+  // Plain handle
+  return { type: 'handle', actor: s.replace(/^@/, '') };
+}
+
+async function resolveHandleToDid(handle) {
+  if (handle.startsWith('did:')) return handle;
+  const url = new URL(`${XRPC}/com.atproto.identity.resolveHandle`);
+  url.searchParams.set('handle', handle);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('PROFILE_NOT_FOUND');
+  return (await res.json()).did;
+}
+
+// Turn parseSource output into a fetch-ready { type, uri } where uri is the
+// final value to drop into the API's actor/feed/list parameter.
+async function resolveSource(parsed) {
+  if (parsed.type === 'handle') {
+    return { type: 'handle', uri: parsed.actor };
+  }
+  if (parsed.uri) return parsed; // already an AT-URI
+  const did = await resolveHandleToDid(parsed.handle);
+  const collection = parsed.type === 'feed'
+    ? 'app.bsky.feed.generator'
+    : 'app.bsky.graph.list';
+  return { type: parsed.type, uri: `at://${did}/${collection}/${parsed.rkey}` };
+}
+
+async function startFeedFor(input, { pushUrl = true } = {}) {
+  if (!input) return;
   if (pushUrl) {
     const url = new URL(window.location);
-    url.searchParams.set('handle', handle);
-    history.pushState({ handle }, '', url);
+    url.searchParams.set('handle', input);
+    history.pushState({ handle: input }, '', url);
   }
-  currentActor = handle;
   cursor = null;
   rawItems.length = 0;
   renderedCount = 0;
   moreBtn.hidden = true;
-  // Clear the gallery before fetching so a failed lookup doesn't leave the
-  // previous handle's media on screen behind the error message.
   for (const v of feedEl.querySelectorAll('.video-thumb video')) {
     videoVisibilityObserver.unobserve(v);
     detachHls(v);
@@ -141,35 +193,34 @@ function startFeedFor(handle, { pushUrl = true } = {}) {
   feedEl.innerHTML = '';
   feedEl.style.height = '';
   setStatus('');
-  loadPage(true);
-}
 
-function normalizeHandle(input) {
-  const s = (input || '').trim();
-  // Pasted profile URL → pull out the handle
-  const m = s.match(/bsky\.app\/profile\/([^\/?#]+)/i);
-  if (m) return m[1];
-  return s.replace(/^@/, '');
+  try {
+    currentSource = await resolveSource(parseSource(input));
+  } catch (err) {
+    setStatus('Bluesky profile not found', 'notice');
+    return;
+  }
+  loadPage(true);
 }
 
 form.addEventListener('submit', (e) => {
   e.preventDefault();
-  // Empty input → use the data-default suggestion.
   const raw = handleInput.value.trim() || handleInput.dataset.default || '';
-  const handle = normalizeHandle(raw);
-  // Reflect the cleaned handle back into the input box.
-  handleInput.value = handle;
-  startFeedFor(handle);
+  if (!raw) return;
+  // For plain profile URLs, simplify the input back to just the handle.
+  const parsed = parseSource(raw);
+  if (parsed.type === 'handle') handleInput.value = parsed.actor;
+  startFeedFor(raw);
 });
 
-// Browser back/forward → reload feed for the previous handle
+// Browser back/forward → reload feed for the previous source
 window.addEventListener('popstate', () => {
-  const handle = new URL(window.location).searchParams.get('handle') || '';
-  handleInput.value = handle;
-  if (handle) startFeedFor(handle, { pushUrl: false });
+  const value = new URL(window.location).searchParams.get('handle') || '';
+  handleInput.value = value;
+  if (value) startFeedFor(value, { pushUrl: false });
 });
 
-// On first load, honor ?handle=… in the URL so links are shareable.
+// On first load, honor ?handle=… so links are shareable.
 (() => {
   const initial = new URL(window.location).searchParams.get('handle');
   if (initial) {
@@ -197,16 +248,15 @@ async function loadPage(isInitial) {
     const startCount = rawItems.length;
     let added = 0;
     while (added < PAGE_SIZE) {
-      const url = new URL(API);
-      url.searchParams.set('actor', currentActor);
+      const cfg = ENDPOINT[currentSource.type];
+      const url = new URL(`${XRPC}/${cfg.path}`);
+      url.searchParams.set(cfg.param, currentSource.uri);
       url.searchParams.set('limit', 100);
       if (cursor) url.searchParams.set('cursor', cursor);
 
       const res = await fetch(url);
       if (!res.ok) {
         const body = await res.text();
-        // Bluesky returns 400 with { error: "InvalidRequest", message: "Profile not found" }
-        // (or "Actor not found") for unknown handles. Surface a clean message.
         if (res.status === 400 && /not found|could not find/i.test(body)) {
           throw new Error('PROFILE_NOT_FOUND');
         }

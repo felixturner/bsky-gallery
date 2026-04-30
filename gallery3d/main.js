@@ -63,11 +63,51 @@ function escapeHtml(s) {
   ));
 }
 
-function normalizeHandle(input) {
+// Detect handle / profile URL / feed URL / list URL / AT-URI
+function parseSource(input) {
   const s = (input || '').trim();
-  const m = s.match(/bsky\.app\/profile\/([^\/?#]+)/i);
-  if (m) return m[1];
-  return s.replace(/^@/, '');
+
+  let m = s.match(/bsky\.app\/profile\/([^\/]+)\/feed\/([^\/?#]+)/i);
+  if (m) return { type: 'feed', handle: m[1], rkey: m[2] };
+
+  m = s.match(/bsky\.app\/profile\/([^\/]+)\/lists\/([^\/?#]+)/i);
+  if (m) return { type: 'list', handle: m[1], rkey: m[2] };
+
+  m = s.match(/bsky\.app\/profile\/([^\/?#]+)/i);
+  if (m) return { type: 'handle', actor: m[1] };
+
+  if (s.startsWith('at://')) {
+    if (s.includes('/app.bsky.feed.generator/')) return { type: 'feed', uri: s };
+    if (s.includes('/app.bsky.graph.list/'))     return { type: 'list', uri: s };
+  }
+
+  return { type: 'handle', actor: s.replace(/^@/, '') };
+}
+
+const XRPC = 'https://public.api.bsky.app/xrpc';
+const ENDPOINT = {
+  handle: { path: 'app.bsky.feed.getAuthorFeed', param: 'actor' },
+  feed:   { path: 'app.bsky.feed.getFeed',       param: 'feed'  },
+  list:   { path: 'app.bsky.feed.getListFeed',   param: 'list'  },
+};
+
+async function resolveHandleToDid(handle) {
+  if (handle.startsWith('did:')) return handle;
+  const url = new URL(`${XRPC}/com.atproto.identity.resolveHandle`);
+  url.searchParams.set('handle', handle);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('PROFILE_NOT_FOUND');
+  return (await res.json()).did;
+}
+
+async function resolveSource(parsed) {
+  if (parsed.type === 'handle') return { type: 'handle', uri: parsed.actor };
+  if (parsed.uri) return parsed;
+  const did = await resolveHandleToDid(parsed.handle);
+  const collection = parsed.type === 'feed'
+    ? 'app.bsky.feed.generator'
+    : 'app.bsky.graph.list';
+  return { type: parsed.type, uri: `at://${did}/${collection}/${parsed.rkey}` };
 }
 
 function setOverlayStatus(msg, kind) {
@@ -77,13 +117,14 @@ function setOverlayStatus(msg, kind) {
 }
 
 // ---- Bluesky fetch ----
-async function fetchMedia(handle) {
+async function fetchMedia(source) {
   const out = [];
   let cursor = null;
 
   while (out.length < MAX_ITEMS) {
-    const url = new URL('https://public.api.bsky.app/xrpc/app.bsky.feed.getAuthorFeed');
-    url.searchParams.set('actor', handle);
+    const cfg = ENDPOINT[source.type];
+    const url = new URL(`${XRPC}/${cfg.path}`);
+    url.searchParams.set(cfg.param, source.uri);
     url.searchParams.set('limit', 100);
     if (cursor) url.searchParams.set('cursor', cursor);
 
@@ -988,26 +1029,32 @@ function init(items) {
 // ---- Boot / handle handling ----
 let sceneLoaded = false;
 
-async function loadFor(handle, { pushUrl = true } = {}) {
-  if (!handle) return;
+async function loadFor(input, { pushUrl = true } = {}) {
+  if (!input) return;
   if (sceneLoaded) {
-    // Scene is one-shot; reload the page so a fresh handle gets a fresh scene.
+    // Scene is one-shot; reload the page so a fresh source gets a fresh scene.
     const url = new URL(window.location);
-    url.searchParams.set('handle', handle);
+    url.searchParams.set('handle', input);
     window.location.assign(url.toString());
     return;
   }
   if (pushUrl) {
     const url = new URL(window.location);
-    url.searchParams.set('handle', handle);
-    history.replaceState({ handle }, '', url);
+    url.searchParams.set('handle', input);
+    history.replaceState({ handle: input }, '', url);
   }
 
-  setOverlayStatus(`Loading @${handle}…`);
+  const parsed = parseSource(input);
+  const label = parsed.type === 'handle'
+    ? `@${parsed.actor}`
+    : `${parsed.type}: ${parsed.handle ? parsed.handle + '/' + parsed.rkey : parsed.uri}`;
+  setOverlayStatus(`Loading ${label}…`);
+
   const goBtn = form.querySelector('button');
   goBtn.disabled = true;
   try {
-    const items = await fetchMedia(handle);
+    const source = await resolveSource(parsed);
+    const items = await fetchMedia(source);
     countEl.textContent = items.length;
     init(items);
     sceneLoaded = true;
@@ -1034,9 +1081,9 @@ form.addEventListener('submit', (e) => {
   e.preventDefault();
   const raw = handleInput.value.trim();
   if (!raw) return;
-  const handle = normalizeHandle(raw);
-  handleInput.value = handle;
-  loadFor(handle);
+  const parsed = parseSource(raw);
+  if (parsed.type === 'handle') handleInput.value = parsed.actor;
+  loadFor(raw);
 });
 
 // On first load, honor ?handle=… so links are shareable (matches 2D gallery).
