@@ -1,14 +1,11 @@
-import * as THREE from 'three';
+import * as THREE from 'three/webgpu';
+import { mrt, output, normalView, pass, mix, uniform } from 'three/tsl';
+import { ao } from 'three/addons/tsl/display/GTAONode.js';
+import { denoise } from 'three/addons/tsl/display/DenoiseNode.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
-import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
-// import { N8AOPostPass } from 'n8ao';
-// import { GTAOPass } from 'three/addons/postprocessing/GTAOPass.js';
-import { SAOPass } from 'three/addons/postprocessing/SAOPass.js';
-import { OutputPass } from 'three/addons/postprocessing/OutputPass.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 import Hls from 'hls.js';
@@ -755,50 +752,46 @@ function init(items) {
   const scene = new THREE.Scene();
 
   const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 200);
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
+  const renderer = new THREE.WebGPURenderer({ antialias: true });
   renderer.setSize(innerWidth, innerHeight);
-  renderer.setPixelRatio(1);
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   document.body.appendChild(renderer.domElement);
 
-  _maxAniso = renderer.capabilities.getMaxAnisotropy();
+  _maxAniso = 16;
   console.log('devicePixelRatio:', window.devicePixelRatio, '→ using', renderer.getPixelRatio());
 
-  // ---- Post-processing: GTAO for geometry-based ambient occlusion ----
-  // Adds darkening at concave corners (wall/floor seams, doorways, partition
-  // edges) that texture aoMap can't capture.
-  const composer = new EffectComposer(renderer);
-  composer.addPass(new RenderPass(scene, camera));
-  // ---- SAO (back to known-working setup after N8AO hung Chrome) ----
-  const saoPass = new SAOPass(scene, camera);
-  saoPass.params.saoIntensity     = 0.0015;
-  saoPass.params.saoKernelRadius  = 3;
-  saoPass.params.saoBias           = 1.5;
-  saoPass.params.saoScale          = 0.3;
-  saoPass.params.saoMinResolution = 0;
-  saoPass.params.saoBlur          = true;
-  saoPass.params.saoBlurRadius     = 4;
-  saoPass.params.saoBlurDepthCutoff = 0.01;
-  composer.addPass(saoPass);
-  composer.addPass(new OutputPass());
+  // ---- Post-processing pipeline (TSL / WebGPU) ----
+  // Single render pass with MRT (color + normal); GTAO + denoise composited
+  // in TSL. The aoEnabled uniform toggles AO contribution at zero cost when off.
+  const aoEnabled = uniform(1);
 
-  // ---- SAO (kept for reference) ----
-  // const saoPass = new SAOPass(scene, camera);
-  // saoPass.params.saoIntensity     = 0.0015;
-  // saoPass.params.saoKernelRadius  = 3;
-  // saoPass.params.saoBias           = 1.5;
-  // saoPass.params.saoScale          = 0.3;
-  // saoPass.params.saoMinResolution = 0;
-  // saoPass.params.saoBlur          = true;
-  // saoPass.params.saoBlurRadius     = 4;
-  // saoPass.params.saoBlurDepthCutoff = 0.01;
-  // composer.addPass(saoPass);
+  const scenePass = pass(scene, camera);
+  scenePass.setMRT(mrt({ output: output, normal: normalView }));
+  const sceneColor  = scenePass.getTextureNode('output');
+  const sceneNormal = scenePass.getTextureNode('normal');
+  const sceneDepth  = scenePass.getTextureNode('depth');
+
+  const aoPass = ao(sceneDepth, sceneNormal, camera);
+  aoPass.resolutionScale  = 0.5;
+  aoPass.distanceExponent.value = 1;
+  aoPass.distanceFallOff.value  = 0.1;
+  aoPass.radius.value     = 1.0;
+  aoPass.scale.value      = 1.5;
+  aoPass.thickness.value  = 1;
+
+  const aoTexture = aoPass.getTextureNode();
+  const denoisedAO = denoise(aoTexture, sceneDepth, sceneNormal, camera).r;
+  const softenedAO = denoisedAO.pow(0.5);
+  const composited = mix(sceneColor, sceneColor.mul(softenedAO), aoEnabled);
+
+  const postProcessing = new THREE.PostProcessing(renderer);
+  postProcessing.outputNode = composited;
 
   // ---- IBL environment ----
   // PMREMGenerator stays alive so we can process HDRs on demand when the user
   // picks one from the GUI. Each environment is cached after first compute.
   const pmremGenerator = new THREE.PMREMGenerator(renderer);
-  pmremGenerator.compileEquirectangularShader();
   const rgbeLoader = new RGBELoader();
   const envCache = new Map(); // key → THREE.Texture
 
@@ -848,6 +841,10 @@ function init(items) {
     maxLights: 6,
     intensity: 12,
   };
+  const toggles = {
+    spotlights: true,
+    gtao:       true,
+  };
   const lightPool = [];
 
   function rebuildPool(size) {
@@ -866,27 +863,27 @@ function init(items) {
   }
 
   if (MODE === 'gallery') {
-    rebuildPool(lightSettings.maxLights);
+    if (toggles.spotlights) rebuildPool(lightSettings.maxLights);
+    aoEnabled.value = toggles.gtao ? 1 : 0;
 
     if (DEV_MODE) {
       const gui = new GUI({ title: 'Lighting' });
+
+      gui.add(toggles, 'spotlights').name('Spotlights')
+        .onChange((v) => rebuildPool(v ? lightSettings.maxLights : 0));
+      gui.add(toggles, 'gtao').name('GTAO')
+        .onChange((v) => { aoEnabled.value = v ? 1 : 0; });
+
       gui.add(lightSettings, 'maxLights', 0, 50, 1).name('Max Spotlights')
-        .onFinishChange((v) => rebuildPool(v));
+        .onFinishChange((v) => { if (toggles.spotlights) rebuildPool(v); });
       gui.add(lightSettings, 'intensity', 0, 50, 0.5).name('Spotlight Intensity');
+
       if (ambient) {
         gui.add(ambient, 'intensity', 0, 5, 0.05).name('Ambient');
       }
       const envSelect = { current: DEFAULT_ENV };
       gui.add(envSelect, 'current', ENV_OPTIONS).name('Environment').onChange(applyEnv);
       gui.add(scene, 'environmentIntensity', 0, 3, 0.05).name('Env Intensity');
-
-      const aoFolder = gui.addFolder('Ambient Occlusion');
-      aoFolder.add(saoPass, 'enabled').name('Enable');
-      aoFolder.add(saoPass.params, 'saoIntensity',    0, 0.01, 0.0005);
-      aoFolder.add(saoPass.params, 'saoKernelRadius', 1, 20,   1);
-      aoFolder.add(saoPass.params, 'saoBias',         0, 2,    0.05);
-      aoFolder.add(saoPass.params, 'saoScale',        0, 2,    0.05);
-      aoFolder.add(saoPass.params, 'saoBlur').name('Blur');
     }
   }
 
@@ -1012,17 +1009,17 @@ function init(items) {
       if (keys.d) controls.moveRight(speed);
     }
     if (MODE === 'gallery') updateLightPool(dt);
-    composer.render();
+    postProcessing.render();
     stats?.update();
   }
-  animate();
+  // WebGPU init is async — wait until the renderer is ready before kicking
+  // off the animation loop.
+  renderer.init().then(animate);
 
   window.addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
-    composer.setSize(innerWidth, innerHeight);
-    saoPass.setSize(innerWidth, innerHeight);
   });
 }
 
