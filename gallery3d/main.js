@@ -3,6 +3,7 @@ import { mrt, output, normalView, pass, mix, uniform } from 'three/tsl';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { denoise } from 'three/addons/tsl/display/DenoiseNode.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
 import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
@@ -113,12 +114,58 @@ function setOverlayStatus(msg, kind) {
   overlayStatus.classList.toggle('error',  kind === 'error');
 }
 
-// ---- Bluesky fetch ----
-async function fetchMedia(source) {
-  const out = [];
-  let cursor = null;
+// ---- Bluesky fetch (paginated) ----
+function parseFeedToMedia(feed, out) {
+  for (const fi of feed) {
+    const post = fi.post;
+    let embed = post.embed;
+    if (!embed) continue;
+    if (embed.$type === 'app.bsky.embed.recordWithMedia#view') embed = embed.media;
+    if (!embed) continue;
 
-  while (out.length < MAX_ITEMS) {
+    const rkey = post.uri.split('/').pop();
+    const authorHandle = post.author.handle;
+    const displayName = post.author.displayName || authorHandle;
+    const postUrl = `https://bsky.app/profile/${authorHandle}/post/${rkey}`;
+    const postText = (post.record && post.record.text) || '';
+    const date = new Date(post.indexedAt).toLocaleDateString(undefined, {
+      year: 'numeric', month: 'short', day: 'numeric',
+    });
+
+    // groupId: stable per-post key so multi-image posts can share frame
+    // styling and target sizing in the gallery.
+    const meta = { authorHandle, displayName, postUrl, postText, date, groupId: post.uri };
+
+    if (embed.$type === 'app.bsky.embed.images#view') {
+      for (const img of embed.images) {
+        out.push({
+          type: 'image',
+          thumb: proxyUrl(img.thumb),
+          full: proxyUrl(img.fullsize),
+          aspectRatio: img.aspectRatio,
+          alt: img.alt || '',
+          ...meta,
+        });
+      }
+    } else if (embed.$type === 'app.bsky.embed.video#view') {
+      out.push({
+        type: 'video',
+        thumb: proxyUrl(embed.thumbnail),
+        full: proxyUrl(embed.playlist),
+        aspectRatio: embed.aspectRatio,
+        alt: embed.alt || '',
+        ...meta,
+      });
+    }
+  }
+}
+
+function createPaginator(source) {
+  let cursor = null;
+  let exhausted = false;
+
+  async function fetchNextPage() {
+    if (exhausted) return [];
     const cfg = ENDPOINT[source.type];
     const url = new URL(`${XRPC}/${cfg.path}`);
     url.searchParams.set(cfg.param, source.uri);
@@ -135,52 +182,25 @@ async function fetchMedia(source) {
     }
     const data = await res.json();
     cursor = data.cursor || null;
-
-    for (const fi of data.feed) {
-      if (out.length >= MAX_ITEMS) break;
-      const post = fi.post;
-      let embed = post.embed;
-      if (!embed) continue;
-      if (embed.$type === 'app.bsky.embed.recordWithMedia#view') embed = embed.media;
-      if (!embed) continue;
-
-      const rkey = post.uri.split('/').pop();
-      const authorHandle = post.author.handle;
-      const displayName = post.author.displayName || authorHandle;
-      const postUrl = `https://bsky.app/profile/${authorHandle}/post/${rkey}`;
-      const postText = (post.record && post.record.text) || '';
-      const date = new Date(post.indexedAt).toLocaleDateString(undefined, {
-        year: 'numeric', month: 'short', day: 'numeric',
-      });
-
-      const meta = { authorHandle, displayName, postUrl, postText, date };
-
-      if (embed.$type === 'app.bsky.embed.images#view') {
-        for (const img of embed.images) {
-          if (out.length >= MAX_ITEMS) break;
-          out.push({
-            type: 'image',
-            thumb: proxyUrl(img.thumb),
-            full: proxyUrl(img.fullsize),
-            aspectRatio: img.aspectRatio,
-            alt: img.alt || '',
-            ...meta,
-          });
-        }
-      } else if (embed.$type === 'app.bsky.embed.video#view') {
-        out.push({
-          type: 'video',
-          thumb: proxyUrl(embed.thumbnail),
-          full: proxyUrl(embed.playlist),
-          aspectRatio: embed.aspectRatio,
-          alt: embed.alt || '',
-          ...meta,
-        });
-      }
-    }
-    if (!cursor) break;
+    if (!cursor) exhausted = true;
+    const out = [];
+    parseFeedToMedia(data.feed, out);
+    return out;
   }
-  return out;
+
+  return { fetchNextPage, get isExhausted() { return exhausted; } };
+}
+
+// Pull pages until we have at least minCount items (or the feed runs out).
+async function fetchInitialMedia(source, minCount) {
+  const paginator = createPaginator(source);
+  const items = [];
+  while (items.length < minCount && !paginator.isExhausted) {
+    const more = await paginator.fetchNextPage();
+    items.push(...more);
+    if (more.length === 0) break;
+  }
+  return { paginator, items };
 }
 
 // ---- Texture loaders ----
@@ -206,7 +226,11 @@ function loadImageTexture(url) {
   });
 }
 
-function makeVideoTexture(playlistUrl) {
+// Track all video elements created in the scene + the mesh each belongs to,
+// so we can set per-video volume based on camera distance each frame.
+const galleryVideos = []; // [{ video, mesh }]
+
+function makeVideoTexture(playlistUrl, mesh) {
   const video = document.createElement('video');
   video.crossOrigin = 'anonymous';
   video.muted = true;
@@ -214,13 +238,27 @@ function makeVideoTexture(playlistUrl) {
   video.playsInline = true;
   video.autoplay = true;
   video.preload = 'auto';
-  video.style.cssText = 'position:fixed;width:1px;height:1px;opacity:0;pointer-events:none;';
+  // Offscreen at intrinsic size — the 1px×1px sizing previously here can
+  // interact badly with WebGPU's copyExternalImageToTexture upload path on
+  // some browsers (textures end up smaller than the video frame, producing
+  // partial-coverage rendering).
+  video.style.cssText = 'position:fixed;left:-9999px;top:-9999px;opacity:0;pointer-events:none;';
   document.body.appendChild(video);
 
   if (video.canPlayType('application/vnd.apple.mpegurl')) {
     video.src = playlistUrl;
   } else if (Hls.isSupported()) {
-    const hls = new Hls();
+    // Force the highest available variant from the start. WebGPU's
+    // VideoTexture is allocated at the first frame's dimensions and doesn't
+    // reallocate when the source upgrades mid-stream — so we pin to the
+    // largest level from the very first segment.
+    const hls = new Hls({
+      abrEwmaDefaultEstimate: 100_000_000, // 100 Mbps initial estimate → top tier
+      capLevelToPlayerSize: false,
+    });
+    hls.on(Hls.Events.MANIFEST_PARSED, (_, data) => {
+      if (data.levels.length > 1) hls.currentLevel = data.levels.length - 1;
+    });
     hls.loadSource(playlistUrl);
     hls.attachMedia(video);
   } else {
@@ -233,6 +271,7 @@ function makeVideoTexture(playlistUrl) {
   tex.minFilter = THREE.LinearFilter;
   tex.magFilter = THREE.LinearFilter;
   tex.generateMipmaps = false;
+  if (mesh) galleryVideos.push({ video, mesh });
   return tex;
 }
 
@@ -278,7 +317,7 @@ function buildCarousel(scene, items) {
       loadImageTexture(item.thumb).then((tex) => { if (tex) applyMap(tex); });
     }
     if (item.type === 'video') {
-      const vtex = makeVideoTexture(item.full);
+      const vtex = makeVideoTexture(item.full, mesh);
       const video = vtex.image;
       const swap = () => applyMap(vtex);
       if (video.readyState >= 2) swap();
@@ -287,6 +326,48 @@ function buildCarousel(scene, items) {
   }
 
   return { planes, startPos: new THREE.Vector3(0, 0, 0) };
+}
+
+// ---- Picture frame GLB ----
+// Loaded once and cached. We measure its natural bounding box so each clone
+// can be stretched to match the artwork it surrounds.
+let frameTemplate = null;
+let frameSize = null; // THREE.Vector3 of natural bbox size
+
+async function loadFrameTemplate() {
+  if (frameTemplate) return frameTemplate;
+  const loader = new GLTFLoader();
+  const gltf = await loader.loadAsync(`${ASSET_BASE}models/fancy_picture_frame.glb`);
+  frameTemplate = gltf.scene;
+  const bbox = new THREE.Box3().setFromObject(frameTemplate);
+  frameSize = new THREE.Vector3();
+  bbox.getSize(frameSize);
+  console.log('Frame natural size:', frameSize);
+  return frameTemplate;
+}
+
+// ---- People GLB ----
+// Each top-level child of people.glb is treated as one person template; we
+// clone N of them per room and fade them out when the camera gets close.
+let peopleTemplates = null;
+
+async function loadPeopleTemplates() {
+  if (peopleTemplates !== null) return peopleTemplates;
+  const loader = new GLTFLoader();
+  const gltf = await loader.loadAsync(`${ASSET_BASE}models/people.glb`);
+  if (gltf.scene.children.length === 0) {
+    peopleTemplates = [gltf.scene];
+  } else {
+    // Fisher-Yates shuffle, then take 10
+    const all = gltf.scene.children.slice();
+    for (let i = all.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [all[i], all[j]] = [all[j], all[i]];
+    }
+    peopleTemplates = all.slice(0, 10);
+  }
+  console.log(`Loaded ${peopleTemplates.length} people templates`);
+  return peopleTemplates;
 }
 
 // ---- Museum placard (rendered to canvas, used as a texture) ----
@@ -351,6 +432,15 @@ function drawExternalLinkIcon(ctx, x, y, size, color = '#111') {
 const PLACARD_PX_W = 720;
 const PLACARD_PX_H = 360;
 
+function ellipsizeLine(ctx, text, maxWidth) {
+  if (ctx.measureText(text).width <= maxWidth) return text;
+  let s = text;
+  while (s.length > 0 && ctx.measureText(s + '…').width > maxWidth) {
+    s = s.slice(0, -1);
+  }
+  return s + '…';
+}
+
 function makePlacardTexture(item) {
   const canvas = document.createElement('canvas');
   canvas.width = PLACARD_PX_W;
@@ -363,36 +453,37 @@ function makePlacardTexture(item) {
 
   const padX = 36;
   const padY = 32;
+  const innerW = PLACARD_PX_W - padX * 2;
   ctx.textBaseline = 'top';
   ctx.fillStyle = '#111';
 
-  // Display name (bold, top)
-  ctx.font = '700 36px Inter, system-ui, -apple-system, sans-serif';
-  ctx.fillText(item.displayName, padX, padY);
+  // Display name (bold, top) — single line, ellipsised if too long
+  ctx.font = '700 48px Inter, system-ui, -apple-system, sans-serif';
+  ctx.fillText(ellipsizeLine(ctx, item.displayName, innerW), padX, padY);
 
   // Body: alt text (preferred) or post text, cropped to 3 lines
-  ctx.font = '400 26px Inter, system-ui, -apple-system, sans-serif';
+  ctx.font = '400 32px Inter, system-ui, -apple-system, sans-serif';
   ctx.fillStyle = '#444';
   const body =
     (item.alt && item.alt.trim()) ||
     (item.postText && item.postText.trim()) ||
     'Untitled';
-  const lines = wrapTextLines(ctx, body, PLACARD_PX_W - padX * 2, 3);
-  let by = padY + 56;
+  const lines = wrapTextLines(ctx, body, innerW, 3);
+  let by = padY + 70;
   for (const line of lines) {
     ctx.fillText(line, padX, by);
-    by += 34;
+    by += 42;
   }
 
   // Footer divider
-  const footerY = PLACARD_PX_H - padY - 36;
+  const footerY = PLACARD_PX_H - padY - 40;
   ctx.fillStyle = '#e6e6e6';
-  ctx.fillRect(padX, footerY, PLACARD_PX_W - padX * 2, 1);
+  ctx.fillRect(padX, footerY, innerW, 1);
 
   // Date (left of footer)
-  ctx.font = '500 22px Inter, system-ui, -apple-system, sans-serif';
+  ctx.font = '500 28px Inter, system-ui, -apple-system, sans-serif';
   ctx.fillStyle = '#666';
-  ctx.fillText(item.date, padX, footerY + 12);
+  ctx.fillText(item.date, padX, footerY + 14);
 
   // External-link icon (right of footer)
   const ICON_SIZE = 28;
@@ -442,254 +533,381 @@ function loadPBRSet(prefix, repeat = 2) {
   return { diff, norm, arm };
 }
 
-// ---- Gallery layout (rooms with doorways, partition walls, spot lights) ----
-function buildGallery(scene, items) {
-  scene.background = new THREE.Color(0x161616);
-  const ambient = new THREE.AmbientLight(0xffffff, 1.8);
-  scene.add(ambient);
+// ---- Gallery layout (endless treadmill of alternating rooms) ----
+// 3 rooms always loaded along -Z; crossing a doorway recycles the trailing
+// room to the front of the line. Big and small rooms alternate by feedIdx
+// (even = small, odd = big). When the feed is exhausted, the next room to
+// be built becomes a forced-small terminal room with a closed far wall.
+const ROOM_W = 14;
+const ROOM_H = 5;
+const ROOM_DEPTHS = { small: 12, big: 16 };
+const DOOR_W = 2.6;
+const DOOR_H = 3.2;
+const WALL_T = 0.2;
+const WALL_TILE_M = 3.5;
+const FLOOR_TILE_M = 1.0;
 
-  const ROOM_H = 5;
-  const DOOR_W = 2.6;
-  const DOOR_H = 3.2;
-  const WALL_T = 0.2;
+const SLOT_COUNT = 5;
+// Recycle bookkeeping: keep at least LOOKAHEAD rooms south of the player
+// and LOOKBEHIND north of them. Crossing into the trigger zone recycles
+// the trailing slot to the leading end and snaps currentSlotIdx back to
+// the anchor (slots.length - 1 - LOOKAHEAD), so voids past the loaded
+// chain are always at least LOOKAHEAD rooms away from the camera.
+const LOOKAHEAD  = 2;
+const LOOKBEHIND = 2;
+const MIN_ROOM_ITEMS = 5;     // remaining-items threshold below which the next room becomes terminal
+const PREFETCH_AHEAD = 30;    // when buffer ahead drops below this, fetch a new page
 
-  // Wall + floor PBR textures (PolyHaven 1k sets in /public/textures).
-  // Texture.repeat stays at 1 — per-mesh UV scaling controls tile density.
-  const wallTex  = loadPBRSet(`${ASSET_BASE}textures/plastered_wall_04_1k/textures/plastered_wall_04`, 1);
-  const floorTex = loadPBRSet(`${ASSET_BASE}textures/concrete_floor_worn_001_1k/textures/concrete_floor_worn_001`, 1);
-  const WALL_TILE_M  = 3.5;  // 1 texture tile per 3.5m of wall
-  const FLOOR_TILE_M = 1.0;  // 1 texture tile per 1m of floor
+const MEDIA_BASE_HEIGHT = 1.6;
+const MEDIA_MAX_W = 2.8;
+const MEDIA_MAX_H = 2.6;
+const FRAME_DEPTH = 0.06;
 
-  const wallMat = new THREE.MeshStandardMaterial({
-    map: wallTex.diff,
-    normalMap: wallTex.norm,
-    aoMap: wallTex.arm,
-    aoMapIntensity: 0.5,        // soften AO so crevices aren't so dark
-    roughnessMap: wallTex.arm,
-    metalnessMap: wallTex.arm,
-    metalness: 0,
-    roughness: 1,
-  });
-  const floorMat = new THREE.MeshStandardMaterial({
-    map: floorTex.diff,
-    normalMap: floorTex.norm,
-    aoMap: floorTex.arm,
-    roughnessMap: floorTex.arm,
-    metalnessMap: floorTex.arm,
-    metalness: 0,
-    roughness: 1,
-  });
-  // Ceiling stays cheap & flat — most users never look up
-  const ceilMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+const PEOPLE_PER_ROOM  = 2;
+const PEOPLE_STANDOFF  = 2.0;  // metres in front of the artwork
+const PEOPLE_FADE_NEAR = 1.0;  // fully invisible at this camera distance
+const PEOPLE_FADE_FAR  = 2.0;  // fully visible beyond this distance
 
-  // Linear gallery: rooms in a row along -Z, sharing N/S walls between them.
-  // All rooms share width so the shared walls fit cleanly. Depth varies.
-  const ROOM_W = 14;
-  const rooms = [
-    { d: 12 },
-    { d: 16 },
-    { d: 12 },
-  ];
+// Place PEOPLE_PER_ROOM cloned people in front of random artworks.
+// Materials are cloned per-instance so opacity is independent; textures
+// stay shared with the GLB template (marked skipMapDispose so disposal
+// doesn't free them).
+function placePeopleInRoom(group, artworks) {
+  if (!peopleTemplates || peopleTemplates.length === 0 || artworks.length === 0) return [];
+  const people = [];
 
-  // Wall surfaces collected for media placement.
-  // { position: Vec3, normal: Vec3 (toward viewer side), width, height, capacity }
+  // Shuffle artworks and take up to PEOPLE_PER_ROOM
+  const candidates = artworks.slice();
+  for (let i = candidates.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
+  }
+  const targets = candidates.slice(0, Math.min(PEOPLE_PER_ROOM, candidates.length));
+
+  for (const art of targets) {
+    const tpl = peopleTemplates[Math.floor(Math.random() * peopleTemplates.length)];
+    const inner = tpl.clone(true);
+    // The GLB lays the 20 templates out in a row (node translations
+    // [0,0,0], [10,0,0], [20,0,0], …). Clone() preserves the node's
+    // translation, so without this each clone lands far from the wrapper.
+    inner.position.set(0, 0, 0);
+    inner.scale.setScalar(0.2);
+    const person = new THREE.Group();
+    person.add(inner);
+
+    const fadeMaterials = [];
+    person.traverse((o) => {
+      if (!o.isMesh || !o.material) return;
+      // Geometries are shared with the GLB template (Three.js Mesh.clone
+      // doesn't deep-copy them) — disposal would invalidate every other
+      // clone's render pipeline.
+      o.userData.skipGeomDispose = true;
+      const wrapMat = (m) => {
+        const c = m.clone();
+        c.transparent = true;
+        c.depthWrite = false;
+        c.opacity = 1;
+        c.map = null;
+        if (c.color) c.color.setHex(0x252525);
+        c.userData.skipMapDispose = true;
+        fadeMaterials.push(c);
+        return c;
+      };
+      o.material = Array.isArray(o.material) ? o.material.map(wrapMat) : wrapMat(o.material);
+    });
+    person.userData.fadeMaterials = fadeMaterials;
+
+    // The artwork stores lightAnchor (in front + above the surface) and
+    // lightTarget (the surface centre) in world coords — use them to
+    // derive the in-room "forward" direction without re-deriving normals.
+    const artPos = art.userData.lightTarget;
+    const lightAnchor = art.userData.lightAnchor;
+    const forward = new THREE.Vector3().subVectors(lightAnchor, artPos);
+    forward.y = 0;
+    if (forward.lengthSq() < 1e-6) continue;
+    forward.normalize();
+    const worldX = artPos.x + forward.x * PEOPLE_STANDOFF;
+    const worldZ = artPos.z + forward.z * PEOPLE_STANDOFF;
+    person.position.set(worldX, 0, worldZ - group.position.z);
+
+    const lookTarget = new THREE.Vector3(artPos.x, person.position.y, artPos.z - group.position.z);
+    person.lookAt(lookTarget);
+
+    group.add(person);
+    people.push(person);
+  }
+  return people;
+}
+
+function defaultRoomType(feedIdx) {
+  return feedIdx % 2 === 0 ? 'small' : 'big';
+}
+
+// Big rooms appear at feedIdx 1, 3, 5, ... — alternate which side the
+// jutting partition sits on, so consecutive big rooms feel different.
+function bigPartitionSide(feedIdx) {
+  return ((feedIdx - 1) / 2) % 2 === 0 ? 'left' : 'right';
+}
+
+// UV-tiled box helper; identical math to the old buildGallery's addBox but
+// parented to a passed-in object instead of the scene root.
+function makeRoomBox(parent, w, h, d, x, y, z, mat, tileM) {
+  const geom = new THREE.BoxGeometry(w, h, d);
+  if (tileM) {
+    const uv = geom.attributes.uv.array;
+    const f = [
+      [d / tileM, h / tileM], [d / tileM, h / tileM], // ±X
+      [w / tileM, d / tileM], [w / tileM, d / tileM], // ±Y
+      [w / tileM, h / tileM], [w / tileM, h / tileM], // ±Z
+    ];
+    for (let face = 0; face < 6; face++) {
+      const [sx, sy] = f[face];
+      const start = face * 8;
+      for (let v = 0; v < 4; v++) {
+        uv[start + v * 2 + 0] *= sx;
+        uv[start + v * 2 + 1] *= sy;
+      }
+    }
+    geom.attributes.uv.needsUpdate = true;
+  }
+  geom.setAttribute('uv1', geom.attributes.uv);
+  const m = new THREE.Mesh(geom, mat);
+  m.position.set(x, y, z);
+  parent.add(m);
+  return m;
+}
+
+// Build a room as a self-contained Group whose center sits at (0,0,groupZ).
+// All walls are owned per-room: adjacent rooms have their walls back-to-back
+// (~2*WALL_T thick total), no z-fighting and trivial disposal on recycle.
+// Returned surface positions are in WORLD coords (groupZ already baked in)
+// since populateRoom consumes them as world-space anchors.
+function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ }, mats) {
+  const { wallMat, floorMat, ceilMat } = mats;
+  const d = ROOM_DEPTHS[type];
+
+  const group = new THREE.Group();
+  group.position.set(0, 0, groupZ);
   const surfaces = [];
 
-  function addBox(w, h, d, x, y, z, mat, tileM /* meters per texture tile */) {
-    const geom = new THREE.BoxGeometry(w, h, d);
-    if (tileM) {
-      // BoxGeometry has 6 faces × 4 verts × 2 uv components = 48 floats.
-      // Face order: [+X, -X, +Y, -Y, +Z, -Z]. Each face's UV currently spans
-      // 0-1. Scale per face by (faceWidth/tileM, faceHeight/tileM) so tile
-      // density is constant regardless of mesh size — small walls don't get
-      // tiny tiles, big walls don't get oversize tiles.
-      const uv = geom.attributes.uv.array;
-      const f = [
-        [d / tileM, h / tileM], [d / tileM, h / tileM], // ±X
-        [w / tileM, d / tileM], [w / tileM, d / tileM], // ±Y
-        [w / tileM, h / tileM], [w / tileM, h / tileM], // ±Z
-      ];
-      for (let face = 0; face < 6; face++) {
-        const [sx, sy] = f[face];
-        const start = face * 8;
-        for (let v = 0; v < 4; v++) {
-          uv[start + v * 2 + 0] *= sx;
-          uv[start + v * 2 + 1] *= sy;
-        }
-      }
-      geom.attributes.uv.needsUpdate = true;
-    }
-    // aoMap on MeshStandardMaterial samples from the uv1 channel; clone uv → uv1
-    geom.setAttribute('uv1', geom.attributes.uv);
-    const m = new THREE.Mesh(geom, mat);
-    m.position.set(x, y, z);
-    scene.add(m);
-    return m;
-  }
+  makeRoomBox(group, ROOM_W, 0.1, d, 0, -0.05, 0, floorMat, FLOOR_TILE_M);
+  makeRoomBox(group, ROOM_W, 0.1, d, 0, ROOM_H + 0.05, 0, ceilMat);
 
-  // X-axis wall (fixed Z) — built ONCE; `sides` lists which faces get media surfaces
-  function buildXWall(centerX, z, length, hasDoor, sides) {
+  // East + west walls (room-local x = ±ROOM_W/2). Small rooms have shorter
+  // side walls (d = 12) — drop their capacity to 2 so pieces aren't cramped
+  // (especially when a slot is doubled into halves).
+  const sideCapacity = type === 'small' ? 2 : 3;
+  makeRoomBox(group, WALL_T, ROOM_H, d, ROOM_W / 2, ROOM_H / 2, 0, wallMat, WALL_TILE_M);
+  surfaces.push({
+    position: new THREE.Vector3(ROOM_W / 2 - WALL_T / 2, ROOM_H / 2, groupZ),
+    normal: new THREE.Vector3(-1, 0, 0),
+    width: d, height: ROOM_H, capacity: sideCapacity,
+  });
+  makeRoomBox(group, WALL_T, ROOM_H, d, -ROOM_W / 2, ROOM_H / 2, 0, wallMat, WALL_TILE_M);
+  surfaces.push({
+    position: new THREE.Vector3(-ROOM_W / 2 + WALL_T / 2, ROOM_H / 2, groupZ),
+    normal: new THREE.Vector3(+1, 0, 0),
+    width: d, height: ROOM_H, capacity: sideCapacity,
+  });
+
+  // North/south end walls. localZ is the wall's outer face (room boundary);
+  // the wall body is inset half-thickness so two adjacent rooms' walls abut
+  // without overlap. sNormal points from wall into THIS room's interior.
+  function addEndWall(localZ, sNormal, hasDoor) {
+    // Wall body inset half-thickness inward from boundary, so two adjacent
+    // rooms' walls abut without overlap. Surface sits on the wall's inner
+    // (room-facing) face, half a thickness further inward from the center.
+    const wallCenterZ = localZ + sNormal * (WALL_T / 2);
+    const surfaceWorldZ = groupZ + wallCenterZ + sNormal * (WALL_T / 2);
     if (!hasDoor) {
-      addBox(length, ROOM_H, WALL_T, centerX, ROOM_H / 2, z, wallMat, WALL_TILE_M);
-      for (const s of sides) {
-        surfaces.push({
-          position: new THREE.Vector3(centerX, ROOM_H / 2, z + s * WALL_T / 2),
-          normal: new THREE.Vector3(0, 0, s),
-          width: length, height: ROOM_H, capacity: 3,
-        });
-      }
+      makeRoomBox(group, ROOM_W, ROOM_H, WALL_T, 0, ROOM_H / 2, wallCenterZ, wallMat, WALL_TILE_M);
+      surfaces.push({
+        position: new THREE.Vector3(0, ROOM_H / 2, surfaceWorldZ),
+        normal: new THREE.Vector3(0, 0, sNormal),
+        width: ROOM_W, height: ROOM_H, capacity: 3,
+      });
     } else {
-      const sideW = (length - DOOR_W) / 2;
+      const sideW = (ROOM_W - DOOR_W) / 2;
       const topH = ROOM_H - DOOR_H;
-      addBox(sideW, ROOM_H, WALL_T, centerX - DOOR_W / 2 - sideW / 2, ROOM_H / 2, z, wallMat, WALL_TILE_M);
-      addBox(sideW, ROOM_H, WALL_T, centerX + DOOR_W / 2 + sideW / 2, ROOM_H / 2, z, wallMat, WALL_TILE_M);
-      addBox(DOOR_W, topH, WALL_T, centerX, DOOR_H + topH / 2, z, wallMat, WALL_TILE_M);
-      for (const s of sides) {
-        surfaces.push({
-          position: new THREE.Vector3(centerX - DOOR_W / 2 - sideW / 2, ROOM_H / 2, z + s * WALL_T / 2),
-          normal: new THREE.Vector3(0, 0, s),
-          width: sideW, height: ROOM_H, capacity: 1,
-        });
-        surfaces.push({
-          position: new THREE.Vector3(centerX + DOOR_W / 2 + sideW / 2, ROOM_H / 2, z + s * WALL_T / 2),
-          normal: new THREE.Vector3(0, 0, s),
-          width: sideW, height: ROOM_H, capacity: 1,
-        });
-      }
+      makeRoomBox(group, sideW, ROOM_H, WALL_T,
+        -DOOR_W / 2 - sideW / 2, ROOM_H / 2, wallCenterZ, wallMat, WALL_TILE_M);
+      makeRoomBox(group, sideW, ROOM_H, WALL_T,
+        +DOOR_W / 2 + sideW / 2, ROOM_H / 2, wallCenterZ, wallMat, WALL_TILE_M);
+      makeRoomBox(group, DOOR_W, topH, WALL_T,
+        0, DOOR_H + topH / 2, wallCenterZ, wallMat, WALL_TILE_M);
+      surfaces.push({
+        position: new THREE.Vector3(-DOOR_W / 2 - sideW / 2, ROOM_H / 2, surfaceWorldZ),
+        normal: new THREE.Vector3(0, 0, sNormal),
+        width: sideW, height: ROOM_H, capacity: 1,
+      });
+      surfaces.push({
+        position: new THREE.Vector3(+DOOR_W / 2 + sideW / 2, ROOM_H / 2, surfaceWorldZ),
+        normal: new THREE.Vector3(0, 0, sNormal),
+        width: sideW, height: ROOM_H, capacity: 1,
+      });
     }
   }
+  // North = +d/2 (toward zCursor=0); inside-facing surface points -Z (sNormal=-1).
+  addEndWall(+d / 2, -1, openNorth);
+  addEndWall(-d / 2, +1, openSouth);
 
-  // Z-axis wall (fixed X) — owned by a single room
-  function buildZWall(x, centerZ, length, normalSign) {
-    addBox(WALL_T, ROOM_H, length, x, ROOM_H / 2, centerZ, wallMat, WALL_TILE_M);
+  // Partition wall — small rooms get the wide cross partition; big rooms get
+  // a side-jutting one whose side alternates by feedIdx.
+  const PART_H = 3.4;
+  const PART_T = 0.18;
+  if (type === 'small') {
+    const partW = ROOM_W * 0.55;
+    makeRoomBox(group, partW, PART_H, PART_T, 0, PART_H / 2, 0, wallMat, WALL_TILE_M);
     surfaces.push({
-      position: new THREE.Vector3(x + normalSign * WALL_T / 2, ROOM_H / 2, centerZ),
-      normal: new THREE.Vector3(normalSign, 0, 0),
-      width: length, height: ROOM_H, capacity: 3,
+      position: new THREE.Vector3(0, PART_H / 2, groupZ + PART_T / 2),
+      normal: new THREE.Vector3(0, 0, +1), width: partW, height: PART_H, capacity: 2,
+    });
+    surfaces.push({
+      position: new THREE.Vector3(0, PART_H / 2, groupZ - PART_T / 2),
+      normal: new THREE.Vector3(0, 0, -1), width: partW, height: PART_H, capacity: 2,
+    });
+  } else {
+    const partD = d * 0.55;
+    const xSign = partitionSide === 'right' ? +1 : -1;
+    const partX = xSign * ROOM_W * 0.18;
+    // Open face of the partition points toward the room's larger side
+    const xNormal = -xSign;
+    makeRoomBox(group, PART_T, PART_H, partD, partX, PART_H / 2, 0, wallMat, WALL_TILE_M);
+    surfaces.push({
+      position: new THREE.Vector3(partX + xNormal * PART_T / 2, PART_H / 2, groupZ),
+      normal: new THREE.Vector3(xNormal, 0, 0), width: partD, height: PART_H, capacity: 2,
+    });
+    surfaces.push({
+      position: new THREE.Vector3(partX - xNormal * PART_T / 2, PART_H / 2, groupZ),
+      normal: new THREE.Vector3(-xNormal, 0, 0), width: partD, height: PART_H, capacity: 2,
     });
   }
 
-  let zCursor = 0; // north edge of current room
-  for (let i = 0; i < rooms.length; i++) {
-    const r = rooms[i];
-    const cz = zCursor - r.d / 2;
+  return { group, surfaces };
+}
 
-    // Floor + ceiling (floor uses small tiles, ceiling stays untextured)
-    addBox(ROOM_W, 0.1, r.d, 0, -0.05, cz, floorMat, FLOOR_TILE_M);
-    addBox(ROOM_W, 0.1, r.d, 0, ROOM_H + 0.05, cz, ceilMat);
-
-    // East + west walls (each room owns its own; no sharing)
-    buildZWall( ROOM_W / 2, cz, r.d, -1);
-    buildZWall(-ROOM_W / 2, cz, r.d, +1);
-
-    // One partition wall per room, alternating orientation
-    const PART_H = 3.4;
-    const PART_T = 0.18;
-    if (i % 2 === 0) {
-      const partW = ROOM_W * 0.55;
-      const partZ = cz;            // centered front-to-back in the room
-      addBox(partW, PART_H, PART_T, 0, PART_H / 2, partZ, wallMat, WALL_TILE_M);
-      surfaces.push({
-        position: new THREE.Vector3(0, PART_H / 2, partZ + PART_T / 2),
-        normal: new THREE.Vector3(0, 0, +1), width: partW, height: PART_H, capacity: 2,
-      });
-      surfaces.push({
-        position: new THREE.Vector3(0, PART_H / 2, partZ - PART_T / 2),
-        normal: new THREE.Vector3(0, 0, -1), width: partW, height: PART_H, capacity: 2,
-      });
-    } else {
-      const partD = r.d * 0.55;
-      const partX = -ROOM_W * 0.18;
-      addBox(PART_T, PART_H, partD, partX, PART_H / 2, cz, wallMat, WALL_TILE_M);
-      surfaces.push({
-        position: new THREE.Vector3(partX + PART_T / 2, PART_H / 2, cz),
-        normal: new THREE.Vector3(+1, 0, 0), width: partD, height: PART_H, capacity: 2,
-      });
-      surfaces.push({
-        position: new THREE.Vector3(partX - PART_T / 2, PART_H / 2, cz),
-        normal: new THREE.Vector3(-1, 0, 0), width: partD, height: PART_H, capacity: 2,
-      });
-    }
-
-    zCursor -= r.d;
-  }
-
-  // Build N/S walls at boundaries — each one ONCE, no z-fighting.
-  // North outer wall of room 0 (solid, surface only on the room-0 side)
-  buildXWall(0, 0, ROOM_W, false, [-1]);
-  // Between every pair of rooms: door wall, surfaces on both sides
-  let zb = 0;
-  for (let i = 0; i < rooms.length - 1; i++) {
-    zb -= rooms[i].d;
-    buildXWall(0, zb, ROOM_W, true, [+1, -1]);
-  }
-  // South outer wall of last room (solid, surface only on its side)
-  zb -= rooms[rooms.length - 1].d;
-  buildXWall(0, zb, ROOM_W, false, [+1]);
-
-  // ---- Place media onto surfaces ----
-  // Each surface has a capacity (2 or 3); spread items along its width.
+// Hang media on the supplied surfaces. Items are pulled from `items` starting
+// at index 0 (caller slices). Artwork meshes are parented to `group`. Spotlight
+// anchors are stored in WORLD coords on the mesh — valid until the room is
+// disposed (rooms don't move once positioned).
+function populateRoom(group, surfaces, items, videoEntries) {
   const planes = [];
-  const artworks = [];        // for spotlight pooling
-  let itemIdx = 0;
-  const MEDIA_BASE_HEIGHT = 1.6;     // hung at eye level
-  const MEDIA_MAX_W = 2.8;            // cap so multiple fit on one surface
-  const MEDIA_MAX_H = 2.6;
+  const artworks = [];
+  let idx = 0;
+
+  // Per-post-group decisions: items from the same bsky post share frame
+  // styling and a target height, so a multi-image post reads as a set.
+  const groupDecisions = new Map();
+  function decisionsFor(item) {
+    const key = item.groupId || item.postUrl || idx;
+    let d = groupDecisions.get(key);
+    if (!d) {
+      d = {
+        // Videos always get a frame; images are framed 50% of the time.
+        hasFrame:    item.type === 'video' ? true : Math.random() < 0.5,
+        frameColor:  Math.random() < 0.5 ? 0xbbbbbb : 0x111111,
+        frameT:      0.04 + Math.random() * 0.04,
+        // Separate target heights per slot type — a multi-image post can
+        // straddle full and half slots; we don't want a small first
+        // sibling to shrink larger ones (or vice-versa).
+        targetHFull: null,
+        targetHHalf: null,
+      };
+      groupDecisions.set(key, d);
+    }
+    return d;
+  }
 
   for (const surf of surfaces) {
-    if (itemIdx >= items.length) break;
-    const n = Math.min(surf.capacity, items.length - itemIdx);
-    if (n === 0) continue;
-
-    // Distribute n media along the surface's width axis
-    // Surface width axis is perpendicular to normal in the XZ plane.
-    const widthAxis = new THREE.Vector3(-surf.normal.z, 0, surf.normal.x); // 90° CCW around Y
-
-    // Reserve some margin
+    if (idx >= items.length) break;
+    const widthAxis = new THREE.Vector3(-surf.normal.z, 0, surf.normal.x);
     const usable = surf.width - 0.6;
-    const slot = usable / n;
+    const N = surf.capacity;            // slot count
+    const slot = usable / N;
     const startOffset = -usable / 2 + slot / 2;
 
-    for (let k = 0; k < n; k++) {
-      const item = items[itemIdx++];
-      const ar = item.aspectRatio ? item.aspectRatio.width / item.aspectRatio.height : 1;
-      let mw = Math.min(MEDIA_MAX_W, slot * 0.8);
+    // Build placements: each slot is either single (one item, full slot
+    // width) or doubled (two items, half-slot width side-by-side).
+    // Doubled pairs are nudged inward toward the slot centre so the pair
+    // reads as a unit rather than two halves stuck to the slot edges.
+    const HALF_INWARD = 0.14; // metres each half is shifted toward centre
+    const placements = [];
+    for (let k = 0; k < N && idx < items.length; k++) {
+      const remaining = items.length - idx;
+      const slotCenter = startOffset + k * slot;
+      const doubleUp = remaining >= 2 && Math.random() < 0.18;
+      if (doubleUp) {
+        placements.push({ item: items[idx++], slotW: slot / 2, along: slotCenter - slot / 4 + HALF_INWARD, isHalf: true });
+        placements.push({ item: items[idx++], slotW: slot / 2, along: slotCenter + slot / 4 - HALF_INWARD, isHalf: true });
+      } else {
+        placements.push({ item: items[idx++], slotW: slot,     along: slotCenter, isHalf: false });
+      }
+    }
+
+    // Size in two passes so multi-image sets stay uniform per slot type.
+    // Pass A: compute each placement's natural max height in its own slot.
+    // Pass B: per group, set targetH{Full,Half} = min of members' naturals;
+    //         then assign every member the group's target.
+    for (const p of placements) {
+      const ar = p.item.aspectRatio ? p.item.aspectRatio.width / p.item.aspectRatio.height : 1;
+      const slotMul = p.isHalf ? 0.6 : 0.8;
+      const maxAllowedW = Math.min(MEDIA_MAX_W, p.slotW * slotMul);
+      let mw = maxAllowedW;
       let mh = mw / ar;
       if (mh > MEDIA_MAX_H) {
         mh = MEDIA_MAX_H;
         mw = mh * ar;
+        if (mw > maxAllowedW) { mw = maxAllowedW; mh = mw / ar; }
       }
-      // Center vertically on this surface (eye-level for tall walls; centered for partitions)
+      p.naturalMh = mh;
+      p.ar = ar;
+    }
+    for (const p of placements) {
+      const groupDec = decisionsFor(p.item);
+      const tKey = p.isHalf ? 'targetHHalf' : 'targetHFull';
+      if (groupDec[tKey] == null || p.naturalMh < groupDec[tKey]) {
+        groupDec[tKey] = p.naturalMh;
+      }
+    }
+    for (const p of placements) {
+      const groupDec = decisionsFor(p.item);
+      const tKey = p.isHalf ? 'targetHHalf' : 'targetHFull';
+      p.mh = groupDec[tKey];
+      p.mw = p.mh * p.ar;
+    }
+
+    for (const __placement of placements) {
+      const { item, slotW, along, isHalf, mw, mh, ar } = __placement;
+      const groupDec = decisionsFor(item);
       const cy = surf.height < ROOM_H ? surf.height / 2 : MEDIA_BASE_HEIGHT;
 
-      const along = startOffset + k * slot;
       const px = surf.position.x + widthAxis.x * along;
       const pz = surf.position.z + widthAxis.z * along;
 
-      // Artwork: box mesh (canvas-frame look) protruding from the wall
-      const FRAME_DEPTH = 0.06;
-      const offset = FRAME_DEPTH / 2 + 0.005; // half-depth + tiny gap to avoid z-fighting
+      // Push the canvas off the wall by a small gap so AO settles in the
+      // crack between the back of the canvas and the wall.
+      const WALL_GAP = 0.04;
+      const offset = FRAME_DEPTH / 2 + WALL_GAP;
       const fx = px + surf.normal.x * offset;
       const fz = pz + surf.normal.z * offset;
 
+      // Half-size (doubled-slot) media gets a red tint so they're visually
+      // identifiable while we iterate on the layout.
+      const tintHex = isHalf ? 0xff6666 : 0xffffff;
       const sideMat  = new THREE.MeshLambertMaterial({ color: 0xffffff });
-      // Basic so the image renders at true colors regardless of lighting.
-      // Trade-off: it doesn't catch spotlights, but stays vibrant.
-      const frontMat = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
-      // Box face order: [+x, -x, +y, -y, +z (front), -z (back)]
-      const boxMats = [sideMat, sideMat, sideMat, sideMat, frontMat, sideMat];
-      const boxGeom = new THREE.BoxGeometry(mw, mh, FRAME_DEPTH);
+      const frontMat = new THREE.MeshBasicMaterial({ color: tintHex, toneMapped: false });
+      const boxMats  = [sideMat, sideMat, sideMat, sideMat, frontMat, sideMat];
+      const boxGeom  = new THREE.BoxGeometry(mw, mh, FRAME_DEPTH);
       const mesh = new THREE.Mesh(boxGeom, boxMats);
-      mesh.position.set(fx, cy, fz);
-      // Face the surface normal direction (so +Z front faces out)
-      mesh.lookAt(fx + surf.normal.x, cy, fz + surf.normal.z);
+      // Convert world XZ to group-local (group sits at (0,0,group.position.z))
+      mesh.position.set(fx, cy, fz - group.position.z);
+      mesh.lookAt(fx + surf.normal.x, cy, (fz - group.position.z) + surf.normal.z);
       mesh.userData.item = item;
       mesh.userData.fullLoaded = false;
-      // Spotlight anchor: positioned in front + above, scaled to media size.
-      // Bigger pieces get a higher anchor and a wider cone so the halo fits.
+
       const mediaSize = Math.max(mw, mh);
-      const forwardDist = 1.4 + mediaSize * 0.2;       // bigger art → push light further out
-      const headroom    = 0.5 + mediaSize * 0.4;       // bigger art → light hangs higher above top
+      const forwardDist = 1.4 + mediaSize * 0.2;
+      const headroom    = 0.5 + mediaSize * 0.4;
       mesh.userData.lightAnchor = new THREE.Vector3(
         fx + surf.normal.x * forwardDist,
         cy + mh / 2 + headroom,
@@ -698,65 +916,457 @@ function buildGallery(scene, items) {
       mesh.userData.lightTarget   = new THREE.Vector3(fx, cy, fz);
       mesh.userData.lightAngle    = Math.min(Math.PI / 4, Math.atan2(mediaSize * 0.7, forwardDist));
       mesh.userData.lightDistance = 5 + mediaSize * 1.5;
-      scene.add(mesh);
+      group.add(mesh);
       planes.push(mesh);
       artworks.push(mesh);
 
+      // ---- Generative frame (50% of artworks get one) ----
+      // Decision lives at the post-group level so a multi-image post reads
+      // as a coherent set (same frame on every image, or none).
+      if (groupDec.hasFrame) {
+        const FRAME_T = groupDec.frameT;
+        const FRAME_FWD = 0.015;                                  // protrudes 1.5cm forward of canvas
+        const frameDepth = FRAME_DEPTH + FRAME_FWD;
+        const frameZ = FRAME_FWD / 2;                             // back stays flush with canvas back
+        const frameMat = new THREE.MeshStandardMaterial({
+          color: groupDec.frameColor, roughness: 0.55, metalness: 0,
+        });
+        const horizGeomT = new THREE.BoxGeometry(mw + 2 * FRAME_T, FRAME_T, frameDepth);
+        const horizGeomB = new THREE.BoxGeometry(mw + 2 * FRAME_T, FRAME_T, frameDepth);
+        const vertGeomL  = new THREE.BoxGeometry(FRAME_T, mh, frameDepth);
+        const vertGeomR  = new THREE.BoxGeometry(FRAME_T, mh, frameDepth);
+        const fTop = new THREE.Mesh(horizGeomT, frameMat);
+        const fBot = new THREE.Mesh(horizGeomB, frameMat);
+        const fLft = new THREE.Mesh(vertGeomL,  frameMat);
+        const fRgt = new THREE.Mesh(vertGeomR,  frameMat);
+        const layoutFrame = (w, h) => {
+          fTop.geometry.dispose();
+          fBot.geometry.dispose();
+          fLft.geometry.dispose();
+          fRgt.geometry.dispose();
+          fTop.geometry = new THREE.BoxGeometry(w + 2 * FRAME_T, FRAME_T, frameDepth);
+          fBot.geometry = new THREE.BoxGeometry(w + 2 * FRAME_T, FRAME_T, frameDepth);
+          fLft.geometry = new THREE.BoxGeometry(FRAME_T, h, frameDepth);
+          fRgt.geometry = new THREE.BoxGeometry(FRAME_T, h, frameDepth);
+          fTop.position.set(0,  h / 2 + FRAME_T / 2, frameZ);
+          fBot.position.set(0, -h / 2 - FRAME_T / 2, frameZ);
+          fLft.position.set(-w / 2 - FRAME_T / 2, 0, frameZ);
+          fRgt.position.set( w / 2 + FRAME_T / 2, 0, frameZ);
+        };
+        layoutFrame(mw, mh);
+        mesh.add(fTop, fBot, fLft, fRgt);
+        mesh.userData.relayoutFrame = layoutFrame;
+      }
+
       const applyMap = (tex) => {
         frontMat.map = tex;
-        frontMat.color.setHex(0xffffff);
+        frontMat.color.setHex(tintHex);
         frontMat.needsUpdate = true;
       };
       if (item.thumb) {
-        loadImageTexture(item.thumb).then((tex) => { if (tex) applyMap(tex); });
+        loadImageTexture(item.thumb).then((tex) => {
+          if (!tex) return;
+          if (!mesh.parent) { tex.dispose(); return; } // room recycled mid-load
+          applyMap(tex);
+        });
       }
+      const PLACARD_W = 0.32;
+      const PLACARD_H = PLACARD_W * (PLACARD_PX_H / PLACARD_PX_W);
+      let placard = null;
+
       if (item.type === 'video') {
-        const vtex = makeVideoTexture(item.full);
-        const video = vtex.image;
-        const swap = () => applyMap(vtex);
-        if (video.readyState >= 2) swap();
-        else video.addEventListener('loadeddata', swap, { once: true });
+        let activeTex = makeVideoTexture(item.full, mesh);
+        const video = activeTex.image;
+        const swap = () => applyMap(activeTex);
+        // Prefer requestVideoFrameCallback so we don't apply the texture
+        // until the browser has actually presented a decoded frame at its
+        // final dimensions (loadeddata can fire before HLS has settled on
+        // a variant).
+        if ('requestVideoFrameCallback' in HTMLVideoElement.prototype) {
+          video.requestVideoFrameCallback(() => swap());
+        } else if (video.readyState >= 2) {
+          swap();
+        } else {
+          video.addEventListener('loadeddata', swap, { once: true });
+        }
+        // Bsky's declared aspectRatio is sometimes wrong (e.g. portrait video
+        // tagged as landscape). Once the real video dimensions are known,
+        // resize the box if it disagrees with what we built.
+        video.addEventListener('loadedmetadata', () => {
+          if (!mesh.parent) return; // recycled
+          const vw = video.videoWidth, vh = video.videoHeight;
+          if (!vw || !vh) return;
+          const realAr = vw / vh;
+          if (Math.abs(realAr - ar) < 0.05) return; // declared was close enough
+          let newW = Math.min(MEDIA_MAX_W, slotW * 0.8);
+          let newH = newW / realAr;
+          if (newH > MEDIA_MAX_H) {
+            newH = MEDIA_MAX_H;
+            newW = newH * realAr;
+          }
+          mesh.geometry.dispose();
+          mesh.geometry = new THREE.BoxGeometry(newW, newH, FRAME_DEPTH);
+          mw = newW; mh = newH;
+          if (placard) {
+            const _ext = groupDec.hasFrame ? groupDec.frameT : 0;
+            const _gap = isHalf ? 0.10 : 0.16;
+            placard.position.x = mw / 2 + _ext + PLACARD_W / 2 + _gap;
+          }
+          mesh.userData.relayoutFrame?.(mw, mh);
+        });
+        // Recreate the WebGPU VideoTexture only on a *real* dimension change
+        // mid-playback (HLS variant switch). The initial 0→N metadata load
+        // also fires `resize`, but at that point the texture hasn't been
+        // allocated yet — Three.js will pick up the correct dimensions on
+        // its first upload, and recreating here just races with that.
+        let lastVideoSize = { w: 0, h: 0 };
+        video.addEventListener('resize', () => {
+          if (!mesh.parent) return; // recycled
+          const w = video.videoWidth, h = video.videoHeight;
+          if (lastVideoSize.w === 0 && lastVideoSize.h === 0) {
+            lastVideoSize = { w, h };
+            return; // first metadata load — let initial allocation handle it
+          }
+          if (w === lastVideoSize.w && h === lastVideoSize.h) return;
+          lastVideoSize = { w, h };
+          const old = activeTex;
+          const fresh = new THREE.VideoTexture(video);
+          fresh.colorSpace = THREE.SRGBColorSpace;
+          fresh.minFilter = THREE.LinearFilter;
+          fresh.magFilter = THREE.LinearFilter;
+          fresh.generateMipmaps = false;
+          activeTex = fresh;
+          applyMap(fresh);
+          old.dispose();
+        });
+        videoEntries.push({ video, mesh, tex: activeTex });
       }
 
-      // ----- Placard: small textured plane, hung to the right -----
       const placardTex = makePlacardTexture(item);
-      const PLACARD_W = 0.375;                                 // 50% bigger
-      const PLACARD_H = PLACARD_W * (PLACARD_PX_H / PLACARD_PX_W);
       const placardGeom = new THREE.PlaneGeometry(PLACARD_W, PLACARD_H);
       const placardMat = new THREE.MeshStandardMaterial({
-        map: placardTex,
-        roughness: 1,
-        metalness: 0,
+        map: placardTex, roughness: 1, metalness: 0,
       });
-      const placard = new THREE.Mesh(placardGeom, placardMat);
-      // Flush against the wall (1mm in front to avoid z-fighting), to the
-      // right of the artwork, vertically centered to the image.
+      placard = new THREE.Mesh(placardGeom, placardMat);
+      // Push the placard back to the wall surface (5mm proud to avoid z-
+      // fighting). Local -Z is toward the wall — the artwork sits
+      // WALL_GAP + FRAME_DEPTH/2 out from the wall, so we negate that.
+      const frameSideExt = groupDec.hasFrame ? groupDec.frameT : 0;
+      const labelGap = isHalf ? 0.10 : 0.16;
       placard.position.set(
-        mw / 2 + PLACARD_W / 2 + 0.08,
+        mw / 2 + frameSideExt + PLACARD_W / 2 + labelGap,
         0,
-        -FRAME_DEPTH / 2 - 0.004
+        -(WALL_GAP + FRAME_DEPTH / 2) + 0.005
       );
       placard.userData.item = item;
+      placard.userData.isPlacard = true;
       mesh.add(placard);
       planes.push(placard);
     }
   }
 
-  // Player starts just inside the first room, looking south
-  const startPos = new THREE.Vector3(0, 1.6, -1.2);
-  return { planes, artworks, startPos, ambient };
+  return { planes, artworks, itemsConsumed: idx };
 }
 
+function createGalleryManager(scene, paginator, initialItems, onCountChange) {
+  scene.background = new THREE.Color(0x161616);
+  const ambient = new THREE.AmbientLight(0xffffff, 1.8);
+  scene.add(ambient);
+
+  const wallTex  = loadPBRSet(`${ASSET_BASE}textures/plastered_wall_04_1k/textures/plastered_wall_04`, 1);
+  const floorTex = loadPBRSet(`${ASSET_BASE}textures/concrete_floor_worn_001_1k/textures/concrete_floor_worn_001`, 1);
+  const wallMat = new THREE.MeshStandardMaterial({
+    map: wallTex.diff, normalMap: wallTex.norm, aoMap: wallTex.arm,
+    aoMapIntensity: 0.5,
+    roughnessMap: wallTex.arm, metalnessMap: wallTex.arm,
+    metalness: 0, roughness: 1,
+  });
+  const floorMat = new THREE.MeshStandardMaterial({
+    map: floorTex.diff, normalMap: floorTex.norm, aoMap: floorTex.arm,
+    roughnessMap: floorTex.arm, metalnessMap: floorTex.arm,
+    metalness: 0, roughness: 1,
+  });
+  const ceilMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const mats = { wallMat, floorMat, ceilMat };
+
+  // Feed buffer
+  const feedItems = [...initialItems];
+  let feedExhausted = paginator.isExhausted;
+  let fetchInflight = null;
+
+  function maybeFetch() {
+    if (fetchInflight || feedExhausted) return;
+    fetchInflight = paginator.fetchNextPage().then((more) => {
+      feedItems.push(...more);
+      feedExhausted = paginator.isExhausted;
+      fetchInflight = null;
+      onCountChange?.(feedItems.length, feedExhausted);
+    }).catch((e) => {
+      console.warn('paginator fetch failed', e);
+      feedExhausted = true;
+      fetchInflight = null;
+    });
+  }
+
+  // Per-feedIdx metadata; persists across recycles so backward walks reuse
+  // the same room geometry + items.
+  const feedIdxMeta = new Map();
+  function metaFor(feedIdx) {
+    let m = feedIdxMeta.get(feedIdx);
+    if (m) return m;
+    const type = defaultRoomType(feedIdx);
+    m = {
+      type,
+      partitionSide: type === 'big' ? bigPartitionSide(feedIdx) : null,
+      openNorth: feedIdx > 0,
+      openSouth: true,
+      itemRange: null,
+      isTerminal: false,
+    };
+    feedIdxMeta.set(feedIdx, m);
+    return m;
+  }
+
+  // Z-position of a feedIdx's room center (sums depths of preceding rooms).
+  function feedIdxCenterZ(feedIdx) {
+    let z = 0;
+    for (let i = 0; i < feedIdx; i++) z -= ROOM_DEPTHS[metaFor(i).type];
+    return z - ROOM_DEPTHS[metaFor(feedIdx).type] / 2;
+  }
+
+  // Item allocation: each feedIdx gets a contiguous range of feedItems on
+  // first build. The range is sticky so backward walks see the same items.
+  function allocItemRangeStart() {
+    let s = 0;
+    for (const meta of feedIdxMeta.values()) {
+      if (meta.itemRange && meta.itemRange.end > s) s = meta.itemRange.end;
+    }
+    return s;
+  }
+
+  // Mesh -> slot (for spotlight filtering and collision-free disposal)
+  const slots = [];
+  let currentSlotIdx = 1; // spawn in middle slot
+
+  function teardownGroup(group, videoEntries) {
+    scene.remove(group);
+    group.traverse((o) => {
+      if (!o.isMesh) return;
+      if (!o.userData?.skipGeomDispose) o.geometry?.dispose();
+      const mlist = Array.isArray(o.material) ? o.material : [o.material];
+      for (const mat of mlist) {
+        if (mat === wallMat || mat === floorMat || mat === ceilMat) continue;
+        // skipMapDispose: textures shared with a GLB template (e.g. people)
+        // — the template still owns them, don't free yet.
+        if (mat.map && !mat.userData?.skipMapDispose) mat.map.dispose();
+        mat.dispose();
+      }
+    });
+    for (const e of videoEntries) {
+      e.video.pause();
+      e.video.remove();
+      const gIdx = galleryVideos.findIndex((g) => g.video === e.video);
+      if (gIdx >= 0) galleryVideos.splice(gIdx, 1);
+    }
+  }
+
+  function disposeSlot(slot) {
+    teardownGroup(slot.group, slot.videoEntries);
+  }
+
+  function buildSlot(feedIdx) {
+    const m = metaFor(feedIdx);
+    const groupZ = feedIdxCenterZ(feedIdx);
+    const { group, surfaces } = buildRoom({
+      type: m.type,
+      partitionSide: m.partitionSide,
+      openNorth: m.openNorth,
+      openSouth: m.openSouth,
+      groupZ,
+    }, mats);
+    scene.add(group);
+
+    if (!m.itemRange) {
+      const start = allocItemRangeStart();
+      m.itemRange = { start, end: start };
+    }
+
+    const videoEntries = [];
+    const itemsForThis = feedItems.slice(m.itemRange.start);
+    const pop = populateRoom(group, surfaces, itemsForThis, videoEntries);
+    m.itemRange.end = m.itemRange.start + pop.itemsConsumed;
+    for (const e of videoEntries) galleryVideos.push({ video: e.video, mesh: e.mesh });
+
+    // If feed is exhausted and there isn't enough left for ANOTHER room,
+    // this room becomes the terminal cap: forced-small, far wall solid.
+    const remaining = feedItems.length - m.itemRange.end;
+    if (feedExhausted && remaining < MIN_ROOM_ITEMS && m.openSouth) {
+      teardownGroup(group, videoEntries);
+      m.openSouth = false;
+      m.isTerminal = true;
+      m.type = 'small';
+      m.partitionSide = null;
+      m.itemRange = { start: m.itemRange.start, end: m.itemRange.start };
+      return buildSlot(feedIdx);
+    }
+
+    const people = placePeopleInRoom(group, pop.artworks);
+
+    return {
+      feedIdx,
+      group,
+      planes: pop.planes,
+      artworks: pop.artworks,
+      videoEntries,
+      people,
+      get type()    { return metaFor(feedIdx).type; },
+      get d()       { return ROOM_DEPTHS[metaFor(feedIdx).type]; },
+      get centerZ() { return group.position.z; },
+      get terminal(){ return metaFor(feedIdx).isTerminal; },
+    };
+  }
+
+  // Initial build: up to SLOT_COUNT slots, stopping if we hit the terminal.
+  for (let i = 0; i < SLOT_COUNT; i++) {
+    const s = buildSlot(i);
+    slots.push(s);
+    if (s.terminal) break;
+  }
+  // If the spawn slot index doesn't exist (e.g. degenerate empty feed),
+  // clamp it. Spawn pos is z=-20 — middle of slot 1 normally.
+  if (currentSlotIdx >= slots.length) currentSlotIdx = slots.length - 1;
+
+  function ensurePrefetched() {
+    const south = slots[slots.length - 1];
+    const meta = feedIdxMeta.get(south.feedIdx);
+    const itemEnd = meta?.itemRange?.end ?? 0;
+    if (feedItems.length - itemEnd < PREFETCH_AHEAD) maybeFetch();
+  }
+
+  function recycleForward() {
+    if (slots[slots.length - 1].terminal) return;
+    const newFeedIdx = slots[slots.length - 1].feedIdx + 1;
+    const oldNorth = slots.shift();
+    disposeSlot(oldNorth);
+    slots.push(buildSlot(newFeedIdx));
+  }
+
+  function recycleBackward() {
+    const newFeedIdx = slots[0].feedIdx - 1;
+    if (newFeedIdx < 0) return false;
+    const oldSouth = slots.pop();
+    disposeSlot(oldSouth);
+    slots.unshift(buildSlot(newFeedIdx));
+    return true;
+  }
+
+  function detectSlotIdx(camera) {
+    const z = camera.position.z;
+    for (let i = 0; i < slots.length; i++) {
+      const s = slots[i];
+      const halfD = s.d / 2;
+      if (z <= s.centerZ + halfD && z >= s.centerZ - halfD) return i;
+    }
+    return -1;
+  }
+
+  const _personWorldPos = new THREE.Vector3();
+  function updatePeopleFade(camera) {
+    for (const slot of slots) {
+      if (!slot.people) continue;
+      for (const person of slot.people) {
+        person.getWorldPosition(_personWorldPos);
+        const d = camera.position.distanceTo(_personWorldPos);
+        let opacity;
+        if (d <= PEOPLE_FADE_NEAR) opacity = 0;
+        else if (d >= PEOPLE_FADE_FAR) opacity = 1;
+        else {
+          const t = (d - PEOPLE_FADE_NEAR) / (PEOPLE_FADE_FAR - PEOPLE_FADE_NEAR);
+          opacity = t * t * (3 - 2 * t); // smoothstep
+        }
+        const last = person.userData.lastOpacity;
+        if (last !== undefined && Math.abs(opacity - last) < 0.005) continue;
+        person.userData.lastOpacity = opacity;
+        person.visible = opacity > 0.001;
+        for (const m of person.userData.fadeMaterials) m.opacity = opacity;
+      }
+    }
+  }
+
+  function update(_dt, camera) {
+    const newIdx = detectSlotIdx(camera);
+    if (newIdx === -1) return;
+
+    // Trigger zones: crossing into them recycles the trailing slot and
+    // snaps the player back to the anchor (one room behind the trigger),
+    // so voids past the loaded chain stay at least LOOKAHEAD/LOOKBEHIND
+    // rooms away from the camera.
+    const fwdTrigger  = slots.length - LOOKAHEAD;       // entering this idx (or higher) → recycle south
+    const fwdAnchor   = fwdTrigger - 1;                  // post-recycle resting idx
+    const backTrigger = LOOKBEHIND - 1;                  // entering this idx (or lower) → recycle north
+    const backAnchor  = backTrigger + 1;
+
+    if (newIdx >= fwdTrigger && currentSlotIdx < fwdTrigger) {
+      if (!slots[slots.length - 1].terminal) {
+        recycleForward();
+        currentSlotIdx = fwdAnchor;
+      } else {
+        currentSlotIdx = newIdx;
+      }
+    } else if (newIdx <= backTrigger && currentSlotIdx > backTrigger) {
+      const ok = recycleBackward();
+      currentSlotIdx = ok ? backAnchor : newIdx;
+    } else {
+      currentSlotIdx = newIdx;
+    }
+
+    ensurePrefetched();
+    updatePeopleFade(camera);
+  }
+
+  return {
+    get planes() {
+      const out = [];
+      for (const s of slots) for (const p of s.planes) out.push(p);
+      return out;
+    },
+    get currentArtworks() {
+      return slots[currentSlotIdx]?.artworks ?? [];
+    },
+    get currentGroup() {
+      return slots[currentSlotIdx]?.group ?? null;
+    },
+    ambient,
+    startPos: new THREE.Vector3(2.5, 1.6, -20),
+    update,
+  };
+}
+
+
 // ---- Scene setup (shared by both modes) ----
-function init(items) {
+// Initial render settings — DPR can be tweaked live; AA requires a reload
+// because antialias is a constructor option on WebGPURenderer.
+const _qs = new URL(window.location).searchParams;
+const initialDPR = parseFloat(_qs.get('dpr')) || 1;
+const initialAA  = _qs.get('aa') !== 'false';
+
+async function init({ items, paginator }) {
   const scene = new THREE.Scene();
 
-  const camera = new THREE.PerspectiveCamera(75, innerWidth / innerHeight, 0.1, 200);
-  const renderer = new THREE.WebGPURenderer({ antialias: true });
+  const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 200);
+  const renderer = new THREE.WebGPURenderer({ antialias: initialAA });
   renderer.setSize(innerWidth, innerHeight);
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+  renderer.setPixelRatio(initialDPR);
   renderer.outputColorSpace = THREE.SRGBColorSpace;
   document.body.appendChild(renderer.domElement);
+
+  // WebGPU backend init must complete before PMREM, postprocessing, etc.
+  await renderer.init();
+  // GLB loads must complete before buildGallery runs (rooms reference them).
+  await Promise.all([
+    loadFrameTemplate().catch((e) => console.warn('Frame GLB load failed:', e)),
+    loadPeopleTemplates().catch((e) => console.warn('People GLB load failed:', e)),
+  ]);
 
   _maxAniso = 16;
   console.log('devicePixelRatio:', window.devicePixelRatio, '→ using', renderer.getPixelRatio());
@@ -774,18 +1384,18 @@ function init(items) {
 
   const aoPass = ao(sceneDepth, sceneNormal, camera);
   aoPass.resolutionScale  = 0.5;
-  aoPass.distanceExponent.value = 1;
-  aoPass.distanceFallOff.value  = 0.1;
-  aoPass.radius.value     = 1.0;
-  aoPass.scale.value      = 1.5;
-  aoPass.thickness.value  = 1;
+  aoPass.distanceExponent.value = 0.7;
+  aoPass.distanceFallOff.value  = 0.45;
+  aoPass.radius.value     = 0.1;
+  aoPass.scale.value      = 2.25;
+  aoPass.thickness.value  = 1.4;
 
   const aoTexture = aoPass.getTextureNode();
   const denoisedAO = denoise(aoTexture, sceneDepth, sceneNormal, camera).r;
   const softenedAO = denoisedAO.pow(0.5);
   const composited = mix(sceneColor, sceneColor.mul(softenedAO), aoEnabled);
 
-  const postProcessing = new THREE.PostProcessing(renderer);
+  const postProcessing = new THREE.RenderPipeline(renderer);
   postProcessing.outputNode = composited;
 
   // ---- IBL environment ----
@@ -826,13 +1436,15 @@ function init(items) {
   const DEFAULT_ENV = `${ASSET_BASE}hdr/studio_small_08_1k.hdr`;
   applyEnv(DEFAULT_ENV);
 
-  const built = MODE === 'carousel' ? buildCarousel(scene, items) : buildGallery(scene, items);
-  const planes = built.planes;
-  const artworks = built.artworks || [];
+  const built = MODE === 'carousel'
+    ? buildCarousel(scene, items)
+    : createGalleryManager(scene, paginator, items, (n, exhausted) => {
+        countEl.textContent = exhausted ? `${n}` : `${n}+`;
+      });
   const ambient = built.ambient || null;
   camera.position.copy(built.startPos);
   // Face -Z by default (looking into the gallery / into the carousel center)
-  if (MODE === 'gallery') camera.lookAt(0, 1.6, -10);
+  if (MODE === 'gallery') camera.lookAt(-3, 1.6, -20);
 
   // ---- Spotlight pool (gallery mode only) ----
   // Forward-renderer is unhappy with many lights, so we keep a fixed-size pool
@@ -842,9 +1454,14 @@ function init(items) {
     intensity: 12,
   };
   const toggles = {
-    spotlights: true,
+    spotlights: false,
     gtao:       true,
+    sound:      true,
+    video:      true,
   };
+  const AUDIO_FULL_DIST    = 1; // metres — full volume within this distance
+  const AUDIO_SILENT_DIST  = 5; // metres — silent at or beyond this distance
+  const _videoWorldPos = new THREE.Vector3();
   const lightPool = [];
 
   function rebuildPool(size) {
@@ -867,12 +1484,24 @@ function init(items) {
     aoEnabled.value = toggles.gtao ? 1 : 0;
 
     if (DEV_MODE) {
-      const gui = new GUI({ title: 'Lighting' });
+      const gui = new GUI({ title: 'Render' });
+
+      const renderSettings = { dpr: initialDPR, aa: initialAA };
+      gui.add(renderSettings, 'dpr', 0.5, 2, 0.25).name('DPR')
+        .onChange((v) => renderer.setPixelRatio(v));
+      gui.add(renderSettings, 'aa').name('Antialias (reloads)')
+        .onChange((v) => {
+          const url = new URL(window.location);
+          url.searchParams.set('aa', v ? 'true' : 'false');
+          window.location.assign(url.toString());
+        });
 
       gui.add(toggles, 'spotlights').name('Spotlights')
         .onChange((v) => rebuildPool(v ? lightSettings.maxLights : 0));
       gui.add(toggles, 'gtao').name('GTAO')
         .onChange((v) => { aoEnabled.value = v ? 1 : 0; });
+      gui.add(toggles, 'sound').name('Sound');
+      gui.add(toggles, 'video').name('Video Playback');
 
       gui.add(lightSettings, 'maxLights', 0, 50, 1).name('Max Spotlights')
         .onFinishChange((v) => { if (toggles.spotlights) rebuildPool(v); });
@@ -884,6 +1513,14 @@ function init(items) {
       const envSelect = { current: DEFAULT_ENV };
       gui.add(envSelect, 'current', ENV_OPTIONS).name('Environment').onChange(applyEnv);
       gui.add(scene, 'environmentIntensity', 0, 3, 0.05).name('Env Intensity');
+
+      const aoFolder = gui.addFolder('GTAO');
+      aoFolder.add(aoPass.radius,            'value', 0.1, 4,    0.05).name('Radius');
+      aoFolder.add(aoPass.scale,             'value', 0,   5,    0.05).name('Scale');
+      aoFolder.add(aoPass.thickness,         'value', 0,   3,    0.05).name('Thickness');
+      aoFolder.add(aoPass.distanceExponent,  'value', 0.1, 5,    0.05).name('Distance Exp');
+      aoFolder.add(aoPass.distanceFallOff,   'value', 0,   1,    0.01).name('Distance Falloff');
+      aoFolder.add(aoPass, 'resolutionScale', 0.25, 1, 0.25).name('Resolution Scale');
     }
   }
 
@@ -892,10 +1529,15 @@ function init(items) {
   function updateLightPool(dt) {
     if (lightPool.length === 0) return;
 
+    // Gallery mode: only artworks in the room the player is currently in
+    // are spotlight candidates. Carousel: use the full set.
+    const candidates = MODE === 'gallery'
+      ? built.currentArtworks
+      : (built.artworks || []);
     // Proximity-only: nearest N artworks get lights, regardless of camera
     // facing. Avoids the pop-in/out at frustum edges, and "lights you can't
     // see" cost the same in the shader anyway.
-    const visible = artworks.slice().sort((a, b) =>
+    const visible = candidates.slice().sort((a, b) =>
       a.position.distanceToSquared(camera.position) -
       b.position.distanceToSquared(camera.position)
     );
@@ -944,10 +1586,22 @@ function init(items) {
     }
   }
 
+  // ---- Ambient + footstep audio ----
+  // Loaded eagerly; playback gated on engage click (browser autoplay policy).
+  const ambienceAudio = new Audio(`${ASSET_BASE}sfx/ambience.mp3`);
+  ambienceAudio.loop = true;
+  ambienceAudio.volume = 0.25;
+  const footstepsAudio = new Audio(`${ASSET_BASE}sfx/footsteps.mp3`);
+  footstepsAudio.loop = true;
+  footstepsAudio.volume = 0.5;
+
   const controls = new PointerLockControls(camera, renderer.domElement);
   // Only the engage prompt locks; clicks on the form/input do not.
   engagePrompt.addEventListener('click', () => controls.lock());
-  controls.addEventListener('lock', () => { overlayEl.hidden = true; });
+  controls.addEventListener('lock', () => {
+    overlayEl.hidden = true;
+    if (toggles.sound) ambienceAudio.play().catch(() => {});
+  });
   // TEMP: keep the scene visible after Esc so the GUI is interactable.
   // Click on the canvas to re-engage pointer lock.
   // controls.addEventListener('unlock', () => { overlayEl.hidden = false; });
@@ -980,12 +1634,14 @@ function init(items) {
   renderer.domElement.addEventListener('mousedown', () => {
     if (!controls.isLocked) return;
     raycaster.setFromCamera(center, camera);
-    const hits = raycaster.intersectObjects(planes, false);
+    const hits = raycaster.intersectObjects(built.planes, false);
     if (hits.length) {
       const plane = hits[0].object;
+      // Only the placard label opens the post; clicking the main image
+      // does nothing so people can frame screenshots without an accidental tab.
+      if (!plane.userData.isPlacard) return;
       const item = plane.userData.item;
-      // Click whatever you're looking at → open the post on Bluesky.
-      if (item.postUrl) window.open(item.postUrl, '_blank', 'noopener');
+      if (item?.postUrl) window.open(item.postUrl, '_blank', 'noopener');
     }
   });
 
@@ -998,8 +1654,15 @@ function init(items) {
   }
 
   const clock = new THREE.Clock();
-  function animate() {
+  // Cap render to 60fps even on high-refresh-rate displays. Browsers RAF at the
+  // display's native rate (often 120Hz) which makes any frame variance feel
+  // jerky; a fixed 60Hz target keeps pacing consistent.
+  const TARGET_FRAME_MS = 1000 / 60;
+  let lastFrameMs = 0;
+  function animate(now) {
     requestAnimationFrame(animate);
+    if (now - lastFrameMs < TARGET_FRAME_MS - 0.5) return;
+    lastFrameMs = now;
     const dt = Math.min(clock.getDelta(), 0.1);
     if (controls.isLocked) {
       const speed = MOVE_SPEED * (keys.shift ? SPRINT_MULT : 1) * dt;
@@ -1008,13 +1671,62 @@ function init(items) {
       if (keys.a) controls.moveRight(-speed);
       if (keys.d) controls.moveRight(speed);
     }
-    if (MODE === 'gallery') updateLightPool(dt);
+    if (MODE === 'gallery') {
+      built.update?.(dt, camera);
+      updateLightPool(dt);
+    }
+
+    // Footsteps when moving + ambience while engaged. Both gated on the
+    // sound toggle so muting also kills these.
+    const moving = controls.isLocked && (keys.w || keys.s || keys.a || keys.d);
+    if (toggles.sound) {
+      if (controls.isLocked && ambienceAudio.paused) ambienceAudio.play().catch(() => {});
+      if (moving) {
+        if (footstepsAudio.paused) footstepsAudio.play().catch(() => {});
+      } else if (!footstepsAudio.paused) {
+        footstepsAudio.pause();
+      }
+    } else {
+      if (!ambienceAudio.paused) ambienceAudio.pause();
+      if (!footstepsAudio.paused) footstepsAudio.pause();
+    }
+
+    // Per-video volume falloff. Browsers block unmuted autoplay until a user
+    // gesture, so once you've engaged (clicked) the videos can sound.
+    // Also: pause videos that aren't in the current room — HLS decode is
+    // expensive and the player can't see them.
+    if (galleryVideos.length) {
+      const currentGroup = MODE === 'gallery' ? built.currentGroup : null;
+      for (const { video, mesh } of galleryVideos) {
+        const inCurrent = MODE !== 'gallery' || mesh.parent === currentGroup;
+        if (inCurrent && toggles.video) {
+          if (video.paused) video.play().catch(() => {});
+          if (toggles.sound) {
+            mesh.getWorldPosition(_videoWorldPos);
+            const d = camera.position.distanceTo(_videoWorldPos);
+            const vol = Math.max(0, Math.min(1,
+              1 - (d - AUDIO_FULL_DIST) / (AUDIO_SILENT_DIST - AUDIO_FULL_DIST)
+            ));
+            if (vol > 0) {
+              if (video.muted) video.muted = false;
+              video.volume = vol;
+            } else if (!video.muted) {
+              video.muted = true;
+            }
+          } else if (!video.muted) {
+            video.muted = true;
+          }
+        } else {
+          if (!video.paused) video.pause();
+          if (!video.muted) video.muted = true;
+        }
+      }
+    }
+
     postProcessing.render();
     stats?.update();
   }
-  // WebGPU init is async — wait until the renderer is ready before kicking
-  // off the animation loop.
-  renderer.init().then(animate);
+  animate(0);
 
   window.addEventListener('resize', () => {
     camera.aspect = innerWidth / innerHeight;
@@ -1051,9 +1763,16 @@ async function loadFor(input, { pushUrl = true } = {}) {
   goBtn.disabled = true;
   try {
     const source = await resolveSource(parsed);
-    const items = await fetchMedia(source);
-    countEl.textContent = items.length;
-    init(items);
+    // Gallery: ~12 items per room × SLOT_COUNT, with margin so initial slots
+    // all get fully populated before async paginator catches up.
+    const minCount = MODE === 'carousel' ? MAX_ITEMS : 70;
+    const { paginator, items } = await fetchInitialMedia(source, minCount);
+    if (items.length === 0 && paginator.isExhausted) {
+      setOverlayStatus('No media found.', 'notice');
+      return;
+    }
+    countEl.textContent = paginator.isExhausted ? `${items.length}` : `${items.length}+`;
+    await init({ items, paginator });
     sceneLoaded = true;
     // Swap modal content from form → engage prompt
     form.hidden = true;
