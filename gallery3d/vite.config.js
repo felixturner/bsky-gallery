@@ -1,6 +1,8 @@
 import { defineConfig } from 'vite';
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
+  // Deployed as a sub-path of the 2D gallery's GitHub Pages site
+  base: command === 'build' ? '/bsky-gallery/3d/' : '/',
   server: {
     proxy: {
       '/cdn-bsky': {
@@ -25,4 +27,4 @@ export default defineConfig({
       },
     },
   },
-});
+}));

@@ -1,74 +1,132 @@
 * { box-sizing: border-box; }
-html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #111; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  overflow: hidden;
+  background: #111;
+  color: #eee;
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
 
 canvas { display: block; }
 
-#status,
-#info {
-  position: fixed;
-  padding: 0.4rem 0.75rem;
-  font-size: 0.8rem;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.5);
-  pointer-events: none;
-  z-index: 10;
-  letter-spacing: 0.02em;
-}
-
-#status { top: 1rem; left: 1rem; }
-#status[hidden] { display: none; }
-
-#info { bottom: 1rem; left: 1rem; color: #aaa; }
-
-#esc-hint {
-  position: fixed;
-  bottom: 1rem;
-  right: 1rem;
-  padding: 0.4rem 0.75rem;
-  font-size: 0.8rem;
-  color: #aaa;
-  background: rgba(0, 0, 0, 0.5);
-  border-radius: 4px;
-  pointer-events: none;
-  z-index: 10;
-  letter-spacing: 0.02em;
-}
-
+/* ---------- Modal overlay ---------- */
 #overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.6);
-  backdrop-filter: blur(4px);
+  background: rgba(0, 0, 0, 0.7);
+  backdrop-filter: blur(6px);
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 50;
-  cursor: pointer;
 }
 #overlay[hidden] { display: none; }
 
 #overlay .panel {
   text-align: center;
-  padding: 2rem 2.5rem;
-  border: 1px solid #333;
-  border-radius: 8px;
-  background: rgba(0, 0, 0, 0.4);
+  padding: 3rem 3.5rem;
+  max-width: 540px;
+  width: calc(100% - 2rem);
 }
-#overlay h1 { margin: 0 0 1rem; font-weight: 600; font-size: 1.4rem; letter-spacing: 0.02em; }
-#overlay p { margin: 0.4rem 0; color: #ccc; font-size: 0.95rem; }
-#overlay .hint { color: #888; font-size: 0.78rem; margin-top: 1rem; }
+
+#overlay h1 {
+  margin: 0 0 2.5rem;
+  font-family: 'Fraunces', Georgia, serif;
+  font-weight: 600;
+  font-size: 3.08rem;
+  letter-spacing: 0.005em;
+  color: #fff;
+}
+
+#form {
+  display: flex;
+  gap: 0.5rem;
+  justify-content: center;
+}
+
+#handle {
+  flex: 1;
+  padding: 0.55rem 0.75rem;
+  border: 1px solid #222;
+  border-radius: 6px;
+  background: #222;
+  color: inherit;
+  font-family: inherit;
+  font-size: 1.05rem;
+}
+#handle:focus { outline: none; border-color: #888; }
+
+button {
+  padding: 0.55rem 1.4rem;
+  border: 1px solid #fff;
+  border-radius: 999px;
+  background: transparent;
+  color: #fff;
+  font-family: inherit;
+  font-weight: 500;
+  cursor: pointer;
+  font-size: 0.9rem;
+  letter-spacing: 0.04em;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+button:hover { background: #fff; color: #111; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+
+#overlay-status {
+  margin: 1.5rem 0 0;
+  font-size: 0.85rem;
+  color: #888;
+  min-height: 1.2em;
+  letter-spacing: 0.04em;
+}
+#overlay-status.notice { color: #fff; font-size: 1rem; }
+#overlay-status.error  { color: #ff6b6b; }
+
+#engage-prompt { margin-top: 2.5rem; cursor: pointer; }
+#engage-prompt .cta {
+  margin: 0;
+  font-family: 'Fraunces', Georgia, serif;
+  font-weight: 600;
+  font-size: 2rem;
+  color: #fff;
+  letter-spacing: 0.005em;
+}
+#engage-prompt .hint {
+  margin: 0.75rem 0 0;
+  color: #888;
+  font-size: 0.78rem;
+  letter-spacing: 0.04em;
+}
+
+/* ---------- HUD when scene is active ---------- */
+#info,
+#esc-hint {
+  position: fixed;
+  padding: 0.4rem 0.75rem;
+  font-size: 0.8rem;
+  border-radius: 4px;
+  background: rgba(0, 0, 0, 0.5);
+  color: #aaa;
+  pointer-events: none;
+  z-index: 10;
+  letter-spacing: 0.02em;
+}
+#info { bottom: 1rem; left: 1rem; }
+#esc-hint { bottom: 1rem; right: 1rem; }
 
 #reticle {
   position: fixed;
   top: 50%;
   left: 50%;
-  width: 4px;
-  height: 4px;
-  background: #fff;
+  width: 10px;
+  height: 10px;
+  background: transparent;
+  border: 1.5px solid #fff;
   border-radius: 50%;
   transform: translate(-50%, -50%);
   pointer-events: none;
   z-index: 5;
-  opacity: 0.7;
-  mix-blend-mode: difference;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
 }

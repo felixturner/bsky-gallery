@@ -1,4 +1,4 @@
-name: Deploy 2D gallery to GitHub Pages
+name: Deploy gallery to GitHub Pages
 
 on:
   push:
@@ -17,22 +17,35 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: gallery2d
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: npm
-          cache-dependency-path: gallery2d/package-lock.json
-      - run: npm ci
-      - run: npm run build
+
+      - name: Build 2D gallery
+        working-directory: gallery2d
+        run: |
+          npm ci
+          npm run build
+
+      - name: Build 3D gallery
+        working-directory: gallery3d
+        run: |
+          npm ci
+          npm run build
+
+      - name: Combine builds
+        run: |
+          mkdir -p dist
+          cp -r gallery2d/dist/. dist/
+          mkdir -p dist/3d
+          cp -r gallery3d/dist/. dist/3d/
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: gallery2d/dist
+          path: dist
 
   deploy:
     needs: build
