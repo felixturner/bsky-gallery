@@ -33,11 +33,16 @@ const escHintEl    = document.getElementById('esc-hint');
 const reticleEl    = document.getElementById('reticle');
 
 // ---- URL proxying ----
-// In dev: route through Vite's local proxy (sets Access-Control-Allow-Origin).
-// In prod: use the public corsproxy.io for images. HLS video probably breaks
-// in prod because relative segment URLs don't survive a `?url=` proxy — set
-// up a Cloudflare Worker for full functionality.
+// Dev: route through Vite's local proxy.
+// Prod: route through a Cloudflare Worker that adds CORS headers to
+// cdn.bsky.app + video.bsky.app responses. The Worker maps:
+//   <WORKER>/cdn/...   → https://cdn.bsky.app/...
+//   <WORKER>/video/... → https://video.bsky.app/...
+// Relative URLs inside the HLS playlist resolve against the worker domain
+// correctly, so video playback works end-to-end.
 const IS_DEV = import.meta.env.DEV;
+const CORS_WORKER = 'https://bsky-cors.felixturner.workers.dev';
+
 function proxyUrl(url) {
   if (!url) return url;
   if (IS_DEV) {
@@ -45,8 +50,12 @@ function proxyUrl(url) {
       .replace(/^https:\/\/cdn\.bsky\.app/, '/cdn-bsky')
       .replace(/^https:\/\/video\.bsky\.app/, '/video-bsky');
   }
-  return `https://corsproxy.io/?url=${encodeURIComponent(url)}`;
+  return url
+    .replace(/^https:\/\/cdn\.bsky\.app/,   `${CORS_WORKER}/cdn`)
+    .replace(/^https:\/\/video\.bsky\.app/, `${CORS_WORKER}/video`);
 }
+
+const ASSET_BASE = import.meta.env.BASE_URL; // '/' in dev, '/bsky-gallery/3d/' in prod
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => (
@@ -408,8 +417,8 @@ function buildGallery(scene, items) {
 
   // Wall + floor PBR textures (PolyHaven 1k sets in /public/textures).
   // Texture.repeat stays at 1 — per-mesh UV scaling controls tile density.
-  const wallTex  = loadPBRSet('/textures/plastered_wall_04_1k/textures/plastered_wall_04', 1);
-  const floorTex = loadPBRSet('/textures/concrete_floor_worn_001_1k/textures/concrete_floor_worn_001', 1);
+  const wallTex  = loadPBRSet(`${ASSET_BASE}textures/plastered_wall_04_1k/textures/plastered_wall_04`, 1);
+  const floorTex = loadPBRSet(`${ASSET_BASE}textures/concrete_floor_worn_001_1k/textures/concrete_floor_worn_001`, 1);
   const WALL_TILE_M  = 3.5;  // 1 texture tile per 3.5m of wall
   const FLOOR_TILE_M = 1.0;  // 1 texture tile per 1m of floor
 
@@ -754,10 +763,10 @@ function init(items) {
 
   const ENV_OPTIONS = {
     'Procedural Room':    'procedural',
-    'Solitude Interior':  '/hdr/solitude_interior_1k.hdr',
-    'Photo Studio':       '/hdr/photo_studio_01_1k.hdr',
-    'Studio Small (1k)':  '/hdr/studio_small_08_1k.hdr',
-    'Studio Small (2k)':  '/hdr/studio_small_08_2k.hdr',
+    'Solitude Interior':  `${ASSET_BASE}hdr/solitude_interior_1k.hdr`,
+    'Photo Studio':       `${ASSET_BASE}hdr/photo_studio_01_1k.hdr`,
+    'Studio Small (1k)':  `${ASSET_BASE}hdr/studio_small_08_1k.hdr`,
+    'Studio Small (2k)':  `${ASSET_BASE}hdr/studio_small_08_2k.hdr`,
   };
 
   function applyEnv(key) {
@@ -780,7 +789,7 @@ function init(items) {
   }
 
   // Default environment
-  const DEFAULT_ENV = '/hdr/studio_small_08_1k.hdr';
+  const DEFAULT_ENV = `${ASSET_BASE}hdr/studio_small_08_1k.hdr`;
   applyEnv(DEFAULT_ENV);
 
   const built = MODE === 'carousel' ? buildCarousel(scene, items) : buildGallery(scene, items);
