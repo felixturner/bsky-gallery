@@ -119,26 +119,27 @@ async function init({ items, paginator }) {
 
   // ---- IBL environment ----
   // PMREMGenerator stays alive so we can process HDRs on demand when the
-  // user picks one from the GUI. Each environment is cached after first compute.
+  // user picks one from the GUI in dev mode. Production only ever uses the
+  // default Studio Small env, so we skip the cache + extra options there.
   const pmremGenerator = new THREE.PMREMGenerator(renderer);
   const hdrLoader = new HDRLoader();
-  const envCache = new Map();
+  const envCache = DEV_MODE ? new Map() : null;
 
-  const ENV_OPTIONS = {
+  const ENV_OPTIONS = DEV_MODE ? {
     'Procedural Room':    'procedural',
     'Solitude Interior':  `${ASSET_BASE}hdr/solitude_interior_1k.hdr`,
     'Photo Studio':       `${ASSET_BASE}hdr/photo_studio_01_1k.hdr`,
     'Studio Small (1k)':  `${ASSET_BASE}hdr/studio_small_08_1k.hdr`,
     'Studio Small (2k)':  `${ASSET_BASE}hdr/studio_small_08_2k.hdr`,
-  };
+  } : null;
   function applyEnv(key) {
-    if (envCache.has(key)) {
+    if (envCache?.has(key)) {
       scene.environment = envCache.get(key);
       return Promise.resolve();
     }
     if (key === 'procedural') {
       const tex = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
-      envCache.set(key, tex);
+      envCache?.set(key, tex);
       scene.environment = tex;
       return Promise.resolve();
     }
@@ -146,7 +147,7 @@ async function init({ items, paginator }) {
       hdrLoader.load(key, (hdr) => {
         const tex = pmremGenerator.fromEquirectangular(hdr).texture;
         hdr.dispose();
-        envCache.set(key, tex);
+        envCache?.set(key, tex);
         scene.environment = tex;
         resolve();
       }, undefined, reject);
@@ -427,7 +428,19 @@ async function init({ items, paginator }) {
         if (!video.muted)  video.muted = true;
         continue;
       }
-      if (video.paused) video.play().catch(() => {});
+      if (video.paused || video.ended) {
+        // HLS via MSE doesn't always honour `loop=true` — when the stream
+        // ends the player can sit on its last frame even though we want
+        // it to restart. Detect that and seek to 0. Otherwise (long pause
+        // resume), nudge currentTime to force hls.js to flush stale buffer.
+        if (video.ended ||
+            (video.duration && video.currentTime >= video.duration - 0.05)) {
+          video.currentTime = 0;
+        } else if (video.currentTime > 0) {
+          video.currentTime = video.currentTime;
+        }
+        video.play().catch(() => {});
+      }
 
       if (!inCurrent || !toggles.sound) {
         if (!video.muted) video.muted = true;

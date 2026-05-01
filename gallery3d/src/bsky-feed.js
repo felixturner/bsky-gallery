@@ -117,6 +117,16 @@ function parseFeedToMedia(feed, out, includeReposts) {
 }
 
 export function createPaginator(source, { includeReposts = true } = {}) {
+  // Lists hit a server-side cap on getListFeed (the AppView only indexes a
+  // shallow window of recent posts from list members). Bypass it by
+  // fetching each member's getAuthorFeed individually and merging.
+  if (source.type === 'list') {
+    return createListPaginator(source.uri, { includeReposts });
+  }
+  return createSinglePaginator(source, { includeReposts });
+}
+
+function createSinglePaginator(source, { includeReposts }) {
   let cursor = null;
   let exhausted = false;
 
@@ -147,14 +157,127 @@ export function createPaginator(source, { includeReposts = true } = {}) {
   return { fetchNextPage, get isExhausted() { return exhausted; } };
 }
 
+// Walk app.bsky.graph.getList pages and collect every member's DID.
+async function fetchAllListMembers(listUri) {
+  const dids = [];
+  let cursor = null;
+  for (let safety = 0; safety < 20; safety++) {
+    const url = new URL(`${XRPC}/app.bsky.graph.getList`);
+    url.searchParams.set('list', listUri);
+    url.searchParams.set('limit', 100);
+    if (cursor) url.searchParams.set('cursor', cursor);
+    const res = await fetch(url);
+    if (!res.ok) break;
+    const data = await res.json();
+    for (const item of (data.items || [])) {
+      if (item.subject?.did) dids.push(item.subject.did);
+    }
+    cursor = data.cursor || null;
+    if (!cursor) break;
+  }
+  return dids;
+}
+
+// Fisher-Yates in place.
+function shuffleInPlace(arr) {
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+// Multi-author "list" paginator: bypasses the getListFeed cap by calling
+// getAuthorFeed per list member. First fetchNextPage fans out to every
+// member in parallel for breadth and shuffles the result so consecutive
+// rooms aren't all one artist. Subsequent calls advance a small batch of
+// per-author cursors at a time (also shuffled) so mid-walk prefetches stay
+// mixed too.
+const LIST_BATCH_SIZE = 5;
+function createListPaginator(listUri, { includeReposts }) {
+  let states = null;          // [{did, cursor, exhausted}]
+  let initialized = false;    // first parallel fan-out done
+  let memberIdx = 0;
+  let allExhausted = false;
+
+  async function ensureInit() {
+    if (states) return;
+    const dids = await fetchAllListMembers(listUri);
+    states = dids.map((did) => ({ did, cursor: null, exhausted: false }));
+    if (states.length === 0) allExhausted = true;
+  }
+
+  async function fetchAuthorPage(s) {
+    if (s.exhausted) return [];
+    const url = new URL(`${XRPC}/app.bsky.feed.getAuthorFeed`);
+    url.searchParams.set('actor', s.did);
+    url.searchParams.set('limit', 100);
+    if (s.cursor) url.searchParams.set('cursor', s.cursor);
+    try {
+      const res = await fetch(url);
+      if (!res.ok) { s.exhausted = true; return []; }
+      const data = await res.json();
+      s.cursor = data.cursor || null;
+      if (!s.cursor) s.exhausted = true;
+      const out = [];
+      parseFeedToMedia(data.feed, out, includeReposts);
+      return out;
+    } catch {
+      s.exhausted = true;
+      return [];
+    }
+  }
+
+  async function fetchNextPage() {
+    await ensureInit();
+    if (allExhausted) return [];
+
+    // First call: fan out to every member in parallel, shuffle so
+    // consecutive rooms get a mix of artists rather than 100 posts from
+    // member 0, then 100 from member 1, etc.
+    if (!initialized) {
+      initialized = true;
+      const results = await Promise.all(states.map(fetchAuthorPage));
+      allExhausted = states.every((s) => s.exhausted);
+      return shuffleInPlace([].concat(...results));
+    }
+
+    // Subsequent calls: pull a small batch of members at a time (so
+    // prefetched rooms keep mixing artists), advance the round-robin
+    // pointer, and shuffle the batch's combined media items.
+    const batch = [];
+    let attempts = 0;
+    while (batch.length < LIST_BATCH_SIZE && attempts < states.length) {
+      if (!states[memberIdx].exhausted) batch.push(states[memberIdx]);
+      memberIdx = (memberIdx + 1) % states.length;
+      attempts++;
+    }
+    if (batch.length === 0) {
+      allExhausted = true;
+      return [];
+    }
+    const results = await Promise.all(batch.map(fetchAuthorPage));
+    allExhausted = states.every((s) => s.exhausted);
+    return shuffleInPlace([].concat(...results));
+  }
+
+  return { fetchNextPage, get isExhausted() { return allExhausted; } };
+}
+
 // Pull pages until we have at least minCount items (or the feed runs out).
+// `getListFeed` / `getFeed` pages can contain 100 posts but zero with
+// image/video embeds (text-only, reposts, link previews) — so a single
+// empty media page doesn't mean the feed is exhausted. Cap iterations
+// instead, to avoid spinning if every page is empty.
+const MAX_INITIAL_PAGES = 20;
 export async function fetchInitialMedia(source, minCount, opts) {
   const paginator = createPaginator(source, opts);
   const items = [];
-  while (items.length < minCount && !paginator.isExhausted) {
+  let pages = 0;
+  while (items.length < minCount && !paginator.isExhausted && pages < MAX_INITIAL_PAGES) {
     const more = await paginator.fetchNextPage();
     items.push(...more);
-    if (more.length === 0) break;
+    pages++;
   }
   return { paginator, items };
 }

@@ -69,6 +69,9 @@ export function makeVideoTexture(playlistUrl, mesh) {
     });
     hls.loadSource(playlistUrl);
     hls.attachMedia(video);
+    // Stash the instance so teardown can call hls.destroy() and free the
+    // worker + MSE buffers (otherwise GC can't reclaim the chain).
+    video._hls = hls;
   } else {
     video.src = playlistUrl;
   }

@@ -452,6 +452,10 @@ export function createGalleryManager(scene, paginator, initialItems, onCountChan
     });
     for (const e of videoEntries) {
       e.video.pause();
+      // hls.js holds a worker + MSE buffers and a back-reference to the
+      // video element — destroy explicitly so GC can reclaim everything.
+      e.video._hls?.destroy();
+      e.video._hls = null;
       e.video.remove();
       const gIdx = galleryVideos.findIndex((g) => g.video === e.video);
       if (gIdx >= 0) galleryVideos.splice(gIdx, 1);
