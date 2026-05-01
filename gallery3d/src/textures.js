@@ -18,6 +18,33 @@ export function setMaxAniso(v) { _maxAniso = v; }
 // gallery teardown can pull them out of the DOM cleanly.
 export const galleryVideos = [];
 
+// Shared "Out on Loan" placeholder used when a thumb fails to load.
+// Dark museum-card aesthetic with centred italic text. Marked
+// skipMapDispose so consumers' teardown paths don't free it.
+let _fallbackTex = null;
+function getFallbackTexture() {
+  if (_fallbackTex) return _fallbackTex;
+  const W = 720, H = 540;
+  const canvas = document.createElement('canvas');
+  canvas.width = W;
+  canvas.height = H;
+  const ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#eeeeee';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#999';
+  ctx.font = 'italic 600 64px Fraunces, Georgia, serif';
+  ctx.fillText('Out on Loan', W / 2, H / 2);
+  _fallbackTex = new THREE.CanvasTexture(canvas);
+  _fallbackTex.colorSpace = THREE.SRGBColorSpace;
+  _fallbackTex.minFilter = THREE.LinearFilter;
+  _fallbackTex.magFilter = THREE.LinearFilter;
+  _fallbackTex.needsUpdate = true;
+  _fallbackTex.userData.skipMapDispose = true;
+  return _fallbackTex;
+}
+
 export function loadImageTexture(url) {
   return new Promise((resolve) => {
     _texLoader.load(
@@ -30,9 +57,10 @@ export function loadImageTexture(url) {
         resolve(tex);
       },
       undefined,
-      (err) => {
-        console.warn('img load failed', url, err);
-        resolve(null);
+      () => {
+        // Failed to load — hand back the shared "missing image" texture
+        // so the artwork shows a placeholder instead of staying white.
+        resolve(getFallbackTexture());
       }
     );
   });

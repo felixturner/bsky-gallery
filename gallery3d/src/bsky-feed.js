@@ -30,7 +30,14 @@ function proxyUrl(url) {
     .replace(/^https:\/\/video\.bsky\.app/, `${CORS_WORKER}/video`);
 }
 
-// Detect handle / profile URL / feed URL / list URL / AT-URI
+// Accepts:
+//   https://bsky.app/profile/handle/feed/RKEY    (full feed URL)
+//   https://bsky.app/profile/handle/lists/RKEY   (full list URL)
+//   https://bsky.app/profile/handle              (full profile URL)
+//   handle/feed/RKEY                              (shorthand)
+//   handle/lists/RKEY                             (shorthand)
+//   at://did/...                                  (AT-URI)
+//   @handle  /  handle.tld                        (bare handle)
 export function parseSource(input) {
   const s = (input || '').trim();
 
@@ -42,6 +49,13 @@ export function parseSource(input) {
 
   m = s.match(/bsky\.app\/profile\/([^\/?#]+)/i);
   if (m) return { type: 'handle', actor: m[1] };
+
+  // Shorthand forms — match the path of the bsky.app URL without the host.
+  m = s.match(/^([^\/\s]+)\/feed\/([^\/?#]+)$/i);
+  if (m) return { type: 'feed', handle: m[1], rkey: m[2] };
+
+  m = s.match(/^([^\/\s]+)\/lists\/([^\/?#]+)$/i);
+  if (m) return { type: 'list', handle: m[1], rkey: m[2] };
 
   if (s.startsWith('at://')) {
     if (s.includes('/app.bsky.feed.generator/')) return { type: 'feed', uri: s };

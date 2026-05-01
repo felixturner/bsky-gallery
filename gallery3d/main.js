@@ -172,7 +172,7 @@ async function init({ items, paginator }) {
   const ambient = built.ambient || null;
   camera.position.copy(built.startPos);
   // Face -Z by default (looking into the gallery / into the carousel center)
-  if (MODE === 'gallery') camera.lookAt(-3, 1.6, -20);
+  if (MODE === 'gallery') camera.lookAt(-3, 1.6, built.startPos.z);
 
   // ---- Spotlight pool (gallery mode only) ----
   // Forward-renderer is unhappy with many lights, so we keep a fixed-size

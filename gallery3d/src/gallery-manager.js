@@ -255,7 +255,12 @@ function populateRoom(group, surfaces, items, videoEntries) {
       if (item.thumb) {
         loadImageTexture(item.thumb).then((tex) => {
           if (!tex) return;
-          if (!mesh.parent) { tex.dispose(); return; } // room recycled mid-load
+          if (!mesh.parent) {
+            // Room recycled mid-load. Don't dispose shared fallbacks
+            // (they're reused across the whole scene).
+            if (!tex.userData?.skipMapDispose) tex.dispose();
+            return;
+          }
           applyMap(tex);
         });
       }
@@ -664,7 +669,10 @@ export function createGalleryManager(scene, paginator, initialItems, onCountChan
       return out;
     },
     ambient,
-    startPos: new THREE.Vector3(2.5, 1.6, -20),
+    // Spawn at the centre of the slot we're starting in (the layout might
+    // be only 1–2 rooms for tiny feeds — the old hard-coded z=-20 lands
+    // outside the gallery in those cases).
+    startPos: new THREE.Vector3(2.5, 1.6, slots[currentSlotIdx]?.centerZ ?? -20),
     update,
     collide,
   };
