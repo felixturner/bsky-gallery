@@ -520,22 +520,54 @@ function buildDevGui({ gui, renderer, scene, ambient, aoPass, aoEnabled,
 // ============================================================
 let sceneLoaded = false;
 
+// Shareable-URL helpers. The location supports three params:
+//   ?handle=<actor>            — bare bsky handle (or full profile URL)
+//   ?list=<handle>/<rkey>      — bsky list (shorter than the bsky.app URL)
+//   ?feed=<handle>/<rkey>      — bsky feed
+// We pick the right one based on parseSource's output and clear the others.
+function urlForParsed(parsed, original) {
+  const url = new URL(window.location);
+  url.searchParams.delete('handle');
+  url.searchParams.delete('list');
+  url.searchParams.delete('feed');
+  if ((parsed.type === 'list' || parsed.type === 'feed')
+      && parsed.handle && parsed.rkey) {
+    url.searchParams.set(parsed.type, `${parsed.handle}/${parsed.rkey}`);
+  } else if (parsed.type === 'handle') {
+    url.searchParams.set('handle', parsed.actor);
+  } else {
+    // AT-URI for a list/feed without a known handle — keep the original.
+    url.searchParams.set('handle', original);
+  }
+  return url;
+}
+
+// Read whichever of (?list / ?feed / ?handle) is set and return a string
+// suitable for the input field + parseSource. Lists/feeds expand back to
+// the bsky.app URL form so the input is human-readable.
+function readBootInput() {
+  const qs = new URL(window.location).searchParams;
+  for (const kind of ['list', 'feed']) {
+    const v = qs.get(kind);
+    if (!v) continue;
+    const m = v.match(/^([^/]+)\/(.+)$/);
+    if (m) return `https://bsky.app/profile/${m[1]}/${kind === 'list' ? 'lists' : 'feed'}/${m[2]}`;
+  }
+  return qs.get('handle') || '';
+}
+
 async function loadFor(input, { pushUrl = true } = {}) {
   if (!input) return;
+  const parsed = parseSource(input);
   if (sceneLoaded) {
     // Scene is one-shot; reload the page so a fresh source gets a fresh scene.
-    const url = new URL(window.location);
-    url.searchParams.set('handle', input);
-    window.location.assign(url.toString());
+    window.location.assign(urlForParsed(parsed, input).toString());
     return;
   }
   if (pushUrl) {
-    const url = new URL(window.location);
-    url.searchParams.set('handle', input);
-    history.replaceState({ handle: input }, '', url);
+    history.replaceState({}, '', urlForParsed(parsed, input));
   }
 
-  const parsed = parseSource(input);
   const label = parsed.type === 'handle'
     ? `@${parsed.actor}`
     : `${parsed.type}: ${parsed.handle ? parsed.handle + '/' + parsed.rkey : parsed.uri}`;
@@ -593,10 +625,10 @@ form.addEventListener('submit', (e) => {
   loadFor(raw);
 });
 
-// On first load, honor ?handle=… so links are shareable (matches 2D).
+// On first load, honor ?list=… / ?feed=… / ?handle=… so links are shareable.
 // We pre-fill the input but don't auto-load — user clicks Go to start.
 (() => {
-  const initial = new URL(window.location).searchParams.get('handle');
+  const initial = readBootInput();
   if (initial) handleInput.value = initial;
   handleInput.focus();
   // Fade the panel (title + form) in. CSS default is opacity 0 so the form
