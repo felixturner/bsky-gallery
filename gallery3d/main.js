@@ -92,7 +92,7 @@ async function init({ items, paginator }) {
   const sceneDepth  = scenePass.getTextureNode('depth');
 
   const aoPass = ao(sceneDepth, sceneNormal, camera);
-  aoPass.resolutionScale  = 0.5;
+  aoPass.resolutionScale  = 0.35;
   aoPass.distanceExponent.value = 0.7;
   aoPass.distanceFallOff.value  = 0.45;
   aoPass.radius.value     = 0.1;
@@ -411,20 +411,24 @@ async function init({ items, paginator }) {
       if (!footstepsAudio.paused) footstepsAudio.pause();
     }
 
-    // Per-video volume + facing check. We never pause non-current-room
-    // videos — pausing/resuming HLS streams was unreliable (videos would
-    // sometimes stay frozen on entry). Mute when off-screen, keep playing.
+    // Per-video state: current room → playing + audio. Adjacent rooms →
+    // playing + muted (so HLS stays warm and re-entry is instant). Rooms
+    // 2+ slots away → fully paused (HLS decode is the biggest CPU cost
+    // and we won't see them anyway).
     if (!galleryVideos.length) return;
     const currentGroup = MODE === 'gallery' ? built.currentGroup : null;
+    const activeGroups = MODE === 'gallery' ? built.activeGroups : null;
     for (const { video, mesh } of galleryVideos) {
-      if (!toggles.video) {
+      const inActive  = MODE !== 'gallery' || activeGroups.has(mesh.parent);
+      const inCurrent = MODE !== 'gallery' || mesh.parent === currentGroup;
+
+      if (!toggles.video || !inActive) {
         if (!video.paused) video.pause();
         if (!video.muted)  video.muted = true;
         continue;
       }
       if (video.paused) video.play().catch(() => {});
 
-      const inCurrent = MODE !== 'gallery' || mesh.parent === currentGroup;
       if (!inCurrent || !toggles.sound) {
         if (!video.muted) video.muted = true;
         continue;

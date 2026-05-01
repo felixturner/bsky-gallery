@@ -48,6 +48,12 @@ const FRAME_COLOR_DARK  = 0x111111;
 // ---- People fade smoothing ----
 const _personWorldPos = new THREE.Vector3();
 
+// Shared unit-cube geometry for every artwork frame box across the entire
+// scene. Each frame mesh just sets its own scale, so adding/removing frames
+// during room recycle is a single Vector3.set instead of building +
+// disposing 4 BoxGeometry objects per artwork.
+const _FRAME_BOX_GEOM = new THREE.BoxGeometry(1, 1, 1);
+
 // Hang media on the supplied surfaces. Items are pulled from `items` starting
 // at index 0 (caller slices). Artwork meshes are parented to `group`. Spotlight
 // anchors are stored in WORLD coords on the mesh — valid until the room is
@@ -217,19 +223,18 @@ function populateRoom(group, surfaces, items, videoEntries) {
         const frameMat = new THREE.MeshStandardMaterial({
           color: groupDec.frameColor, roughness: 0.55, metalness: 0,
         });
-        const fTop = new THREE.Mesh(new THREE.BoxGeometry(mw + 2 * FRAME_T, FRAME_T, frameDepth), frameMat);
-        const fBot = new THREE.Mesh(new THREE.BoxGeometry(mw + 2 * FRAME_T, FRAME_T, frameDepth), frameMat);
-        const fLft = new THREE.Mesh(new THREE.BoxGeometry(FRAME_T, mh, frameDepth), frameMat);
-        const fRgt = new THREE.Mesh(new THREE.BoxGeometry(FRAME_T, mh, frameDepth), frameMat);
+        // Reuse a single shared unit cube — each frame mesh just scales it.
+        // skipGeomDispose so room teardown doesn't free the shared buffer.
+        const fTop = new THREE.Mesh(_FRAME_BOX_GEOM, frameMat);
+        const fBot = new THREE.Mesh(_FRAME_BOX_GEOM, frameMat);
+        const fLft = new THREE.Mesh(_FRAME_BOX_GEOM, frameMat);
+        const fRgt = new THREE.Mesh(_FRAME_BOX_GEOM, frameMat);
+        for (const f of [fTop, fBot, fLft, fRgt]) f.userData.skipGeomDispose = true;
         const layoutFrame = (w, h) => {
-          fTop.geometry.dispose();
-          fBot.geometry.dispose();
-          fLft.geometry.dispose();
-          fRgt.geometry.dispose();
-          fTop.geometry = new THREE.BoxGeometry(w + 2 * FRAME_T, FRAME_T, frameDepth);
-          fBot.geometry = new THREE.BoxGeometry(w + 2 * FRAME_T, FRAME_T, frameDepth);
-          fLft.geometry = new THREE.BoxGeometry(FRAME_T, h, frameDepth);
-          fRgt.geometry = new THREE.BoxGeometry(FRAME_T, h, frameDepth);
+          fTop.scale.set(w + 2 * FRAME_T, FRAME_T, frameDepth);
+          fBot.scale.set(w + 2 * FRAME_T, FRAME_T, frameDepth);
+          fLft.scale.set(FRAME_T, h, frameDepth);
+          fRgt.scale.set(FRAME_T, h, frameDepth);
           fTop.position.set(0,  h / 2 + FRAME_T / 2, frameZ);
           fBot.position.set(0, -h / 2 - FRAME_T / 2, frameZ);
           fLft.position.set(-w / 2 - FRAME_T / 2, 0, frameZ);
@@ -643,6 +648,16 @@ export function createGalleryManager(scene, paginator, initialItems, onCountChan
     },
     get currentGroup() {
       return slots[currentSlotIdx]?.group ?? null;
+    },
+    // Current + adjacent (±1) slot groups. Used by the video/audio loop:
+    // videos in active rooms keep playing/decoding so re-entry is instant;
+    // far rooms get fully paused to save HLS decode CPU.
+    get activeGroups() {
+      const out = new Set();
+      const lo = Math.max(0, currentSlotIdx - 1);
+      const hi = Math.min(slots.length - 1, currentSlotIdx + 1);
+      for (let i = lo; i <= hi; i++) out.add(slots[i].group);
+      return out;
     },
     ambient,
     startPos: new THREE.Vector3(2.5, 1.6, -20),
