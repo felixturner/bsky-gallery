@@ -12,15 +12,17 @@ html, body {
 canvas { display: block; }
 
 /* ---------- Modal overlay ---------- */
+/* Solid black so the gallery is hidden until the user clicks "enter".
+   Engage click fades opacity to 0 then sets [hidden]. */
 #overlay {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.7);
-  backdrop-filter: blur(6px);
+  background: #000;
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 50;
+  transition: opacity 0.35s ease-out;
 }
 #overlay[hidden] { display: none; }
 
@@ -35,9 +37,10 @@ canvas { display: block; }
   margin: 0 0 2.5rem;
   font-family: 'Fraunces', Georgia, serif;
   font-weight: 600;
-  font-size: 3.08rem;
+  font-size: 3rem;
   letter-spacing: 0.005em;
   color: #fff;
+  white-space: nowrap;
 }
 
 #form {
@@ -45,6 +48,7 @@ canvas { display: block; }
   gap: 0.5rem;
   justify-content: center;
 }
+#form[hidden] { display: none; }
 
 #handle {
   flex: 1;
@@ -89,7 +93,7 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   margin: 0;
   font-family: 'Fraunces', Georgia, serif;
   font-weight: 600;
-  font-size: 2rem;
+  font-size: 2.8rem;
   color: #fff;
   letter-spacing: 0.005em;
 }

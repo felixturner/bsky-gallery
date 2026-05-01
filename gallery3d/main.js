@@ -1,11 +1,12 @@
 import * as THREE from 'three/webgpu';
+const { Timer } = THREE;
 import { mrt, output, normalView, pass, mix, uniform } from 'three/tsl';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { denoise } from 'three/addons/tsl/display/DenoiseNode.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { EXRLoader } from 'three/addons/loaders/EXRLoader.js';
-import { RGBELoader } from 'three/addons/loaders/RGBELoader.js';
+import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
@@ -507,24 +508,22 @@ const _texLoader = new THREE.TextureLoader();
 // Set after renderer is created so we know the GPU's max anisotropy.
 let _maxAniso = 8;
 
-function loadPBRSet(prefix, repeat = 2) {
-  const diff = _texLoader.load(`${prefix}_diff_1k.jpg`);
-  diff.colorSpace = THREE.SRGBColorSpace;
-
+async function loadPBRSet(prefix, repeat = 2) {
   // ARM = AO (R) + Roughness (G) + Metalness (B), packed into one JPEG.
   // Three.js samples the right channel per slot when the same texture is
-  // assigned to aoMap / roughnessMap / metalnessMap.
-  const arm = _texLoader.load(`${prefix}_arm_1k.jpg`);
-
-  // EXRLoader produces float textures and does NOT auto-generate mipmaps;
-  // explicitly enable so the normal map filters cleanly at grazing angles.
-  const norm = _exrLoader.load(`${prefix}_nor_gl_1k.exr`, (tex) => {
-    tex.generateMipmaps = true;
-    tex.minFilter = THREE.LinearMipmapLinearFilter;
-    tex.magFilter = THREE.LinearFilter;
-    tex.needsUpdate = true;
-  });
-
+  // assigned to aoMap / roughnessMap / metalnessMap. EXRLoader produces
+  // float textures and does NOT auto-generate mipmaps; we enable them
+  // explicitly below so the normal map filters cleanly at grazing angles.
+  const [diff, arm, norm] = await Promise.all([
+    _texLoader.loadAsync(`${prefix}_diff_1k.jpg`),
+    _texLoader.loadAsync(`${prefix}_arm_1k.jpg`),
+    _exrLoader.loadAsync(`${prefix}_nor_gl_1k.exr`),
+  ]);
+  diff.colorSpace = THREE.SRGBColorSpace;
+  norm.generateMipmaps = true;
+  norm.minFilter = THREE.LinearMipmapLinearFilter;
+  norm.magFilter = THREE.LinearFilter;
+  norm.needsUpdate = true;
   for (const t of [diff, norm, arm]) {
     t.wrapS = t.wrapT = THREE.RepeatWrapping;
     t.repeat.set(repeat, repeat);
@@ -544,6 +543,7 @@ const ROOM_DEPTHS = { small: 12, big: 16 };
 const DOOR_W = 2.6;
 const DOOR_H = 3.2;
 const WALL_T = 0.2;
+const WALL_LIFT = 0.02; // bottom of walls sits this far above the floor; same gap above
 const WALL_TILE_M = 3.5;
 const FLOOR_TILE_M = 1.0;
 
@@ -565,8 +565,8 @@ const FRAME_DEPTH = 0.06;
 
 const PEOPLE_PER_ROOM  = 2;
 const PEOPLE_STANDOFF  = 2.0;  // metres in front of the artwork
-const PEOPLE_FADE_NEAR = 1.0;  // fully invisible at this camera distance
-const PEOPLE_FADE_FAR  = 2.0;  // fully visible beyond this distance
+const PEOPLE_FADE_NEAR = 2.0;  // fully invisible at this camera distance
+const PEOPLE_FADE_FAR  = 4.0;  // fully visible beyond this distance
 
 // Place PEOPLE_PER_ROOM cloned people in front of random artworks.
 // Materials are cloned per-instance so opacity is independent; textures
@@ -689,21 +689,33 @@ function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ }, mats) 
   const group = new THREE.Group();
   group.position.set(0, 0, groupZ);
   const surfaces = [];
+  // World-space X/Z bounds of every wall section, used for player collision.
+  const wallAABBs = [];
+  function pushAABB(centerX, centerZ, w, dz) {
+    wallAABBs.push({
+      minX: centerX - w / 2, maxX: centerX + w / 2,
+      minZ: centerZ - dz / 2, maxZ: centerZ + dz / 2,
+    });
+  }
 
   makeRoomBox(group, ROOM_W, 0.1, d, 0, -0.05, 0, floorMat, FLOOR_TILE_M);
-  makeRoomBox(group, ROOM_W, 0.1, d, 0, ROOM_H + 0.05, 0, ceilMat);
+  // Ceiling sits one extra WALL_LIFT above the wall tops so the floor/wall
+  // and wall/ceiling reveals are symmetric.
+  makeRoomBox(group, ROOM_W, 0.1, d, 0, ROOM_H + 0.05 + 2 * WALL_LIFT, 0, ceilMat);
 
   // East + west walls (room-local x = ±ROOM_W/2). Small rooms have shorter
   // side walls (d = 12) — drop their capacity to 2 so pieces aren't cramped
   // (especially when a slot is doubled into halves).
   const sideCapacity = type === 'small' ? 2 : 3;
-  makeRoomBox(group, WALL_T, ROOM_H, d, ROOM_W / 2, ROOM_H / 2, 0, wallMat, WALL_TILE_M);
+  makeRoomBox(group, WALL_T, ROOM_H, d, ROOM_W / 2, ROOM_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);
+  pushAABB(ROOM_W / 2, groupZ, WALL_T, d);
   surfaces.push({
     position: new THREE.Vector3(ROOM_W / 2 - WALL_T / 2, ROOM_H / 2, groupZ),
     normal: new THREE.Vector3(-1, 0, 0),
     width: d, height: ROOM_H, capacity: sideCapacity,
   });
-  makeRoomBox(group, WALL_T, ROOM_H, d, -ROOM_W / 2, ROOM_H / 2, 0, wallMat, WALL_TILE_M);
+  makeRoomBox(group, WALL_T, ROOM_H, d, -ROOM_W / 2, ROOM_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);
+  pushAABB(-ROOM_W / 2, groupZ, WALL_T, d);
   surfaces.push({
     position: new THREE.Vector3(-ROOM_W / 2 + WALL_T / 2, ROOM_H / 2, groupZ),
     normal: new THREE.Vector3(+1, 0, 0),
@@ -720,7 +732,8 @@ function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ }, mats) 
     const wallCenterZ = localZ + sNormal * (WALL_T / 2);
     const surfaceWorldZ = groupZ + wallCenterZ + sNormal * (WALL_T / 2);
     if (!hasDoor) {
-      makeRoomBox(group, ROOM_W, ROOM_H, WALL_T, 0, ROOM_H / 2, wallCenterZ, wallMat, WALL_TILE_M);
+      makeRoomBox(group, ROOM_W, ROOM_H, WALL_T, 0, ROOM_H / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
+      pushAABB(0, groupZ + wallCenterZ, ROOM_W, WALL_T);
       surfaces.push({
         position: new THREE.Vector3(0, ROOM_H / 2, surfaceWorldZ),
         normal: new THREE.Vector3(0, 0, sNormal),
@@ -730,11 +743,14 @@ function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ }, mats) 
       const sideW = (ROOM_W - DOOR_W) / 2;
       const topH = ROOM_H - DOOR_H;
       makeRoomBox(group, sideW, ROOM_H, WALL_T,
-        -DOOR_W / 2 - sideW / 2, ROOM_H / 2, wallCenterZ, wallMat, WALL_TILE_M);
+        -DOOR_W / 2 - sideW / 2, ROOM_H / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
+      pushAABB(-DOOR_W / 2 - sideW / 2, groupZ + wallCenterZ, sideW, WALL_T);
       makeRoomBox(group, sideW, ROOM_H, WALL_T,
-        +DOOR_W / 2 + sideW / 2, ROOM_H / 2, wallCenterZ, wallMat, WALL_TILE_M);
+        +DOOR_W / 2 + sideW / 2, ROOM_H / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
+      pushAABB(+DOOR_W / 2 + sideW / 2, groupZ + wallCenterZ, sideW, WALL_T);
+      // Transom above the doorway: no AABB — player walks under it.
       makeRoomBox(group, DOOR_W, topH, WALL_T,
-        0, DOOR_H + topH / 2, wallCenterZ, wallMat, WALL_TILE_M);
+        0, DOOR_H + topH / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
       surfaces.push({
         position: new THREE.Vector3(-DOOR_W / 2 - sideW / 2, ROOM_H / 2, surfaceWorldZ),
         normal: new THREE.Vector3(0, 0, sNormal),
@@ -757,7 +773,8 @@ function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ }, mats) 
   const PART_T = 0.18;
   if (type === 'small') {
     const partW = ROOM_W * 0.55;
-    makeRoomBox(group, partW, PART_H, PART_T, 0, PART_H / 2, 0, wallMat, WALL_TILE_M);
+    makeRoomBox(group, partW, PART_H, PART_T, 0, PART_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);
+    pushAABB(0, groupZ, partW, PART_T);
     surfaces.push({
       position: new THREE.Vector3(0, PART_H / 2, groupZ + PART_T / 2),
       normal: new THREE.Vector3(0, 0, +1), width: partW, height: PART_H, capacity: 2,
@@ -772,7 +789,8 @@ function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ }, mats) 
     const partX = xSign * ROOM_W * 0.18;
     // Open face of the partition points toward the room's larger side
     const xNormal = -xSign;
-    makeRoomBox(group, PART_T, PART_H, partD, partX, PART_H / 2, 0, wallMat, WALL_TILE_M);
+    makeRoomBox(group, PART_T, PART_H, partD, partX, PART_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);
+    pushAABB(partX, groupZ, PART_T, partD);
     surfaces.push({
       position: new THREE.Vector3(partX + xNormal * PART_T / 2, PART_H / 2, groupZ),
       normal: new THREE.Vector3(xNormal, 0, 0), width: partD, height: PART_H, capacity: 2,
@@ -783,7 +801,7 @@ function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ }, mats) 
     });
   }
 
-  return { group, surfaces };
+  return { group, surfaces, wallAABBs };
 }
 
 // Hang media on the supplied surfaces. Items are pulled from `items` starting
@@ -794,6 +812,12 @@ function populateRoom(group, surfaces, items, videoEntries) {
   const planes = [];
   const artworks = [];
   let idx = 0;
+
+  // Placard dimensions are needed both during the doubled-pair layout pass
+  // (to compute unit footprints) and per-item placement, so hoist them.
+  const PLACARD_W = 0.32;
+  const PLACARD_H = PLACARD_W * (PLACARD_PX_H / PLACARD_PX_W);
+  const PAIR_INTER_GAP = 0.10; // gap between two units inside a doubled slot
 
   // Per-post-group decisions: items from the same bsky post share frame
   // styling and a target height, so a multi-image post reads as a set.
@@ -826,19 +850,21 @@ function populateRoom(group, surfaces, items, videoEntries) {
     const slot = usable / N;
     const startOffset = -usable / 2 + slot / 2;
 
-    // Build placements: each slot is either single (one item, full slot
-    // width) or doubled (two items, half-slot width side-by-side).
-    // Doubled pairs are nudged inward toward the slot centre so the pair
-    // reads as a unit rather than two halves stuck to the slot edges.
-    const HALF_INWARD = 0.14; // metres each half is shifted toward centre
+    // Build placements: singles use slot center; doubled get along set
+    // later by the pair-layout pass after sizes are known.
     const placements = [];
+    let pairCounter = 0;
     for (let k = 0; k < N && idx < items.length; k++) {
       const remaining = items.length - idx;
       const slotCenter = startOffset + k * slot;
-      const doubleUp = remaining >= 2 && Math.random() < 0.18;
+      // Partition surfaces (shorter than ROOM_H) have narrow slots — labels
+      // get squeezed even with the centred-pair layout, so skip doubling.
+      const isPartition = surf.height < ROOM_H;
+      const doubleUp = !isPartition && remaining >= 2 && Math.random() < 0.18;
       if (doubleUp) {
-        placements.push({ item: items[idx++], slotW: slot / 2, along: slotCenter - slot / 4 + HALF_INWARD, isHalf: true });
-        placements.push({ item: items[idx++], slotW: slot / 2, along: slotCenter + slot / 4 - HALF_INWARD, isHalf: true });
+        const pid = pairCounter++;
+        placements.push({ item: items[idx++], slotW: slot / 2, along: 0, isHalf: true, pairSide: 'left',  pairId: pid, pairCenter: slotCenter });
+        placements.push({ item: items[idx++], slotW: slot / 2, along: 0, isHalf: true, pairSide: 'right', pairId: pid, pairCenter: slotCenter });
       } else {
         placements.push({ item: items[idx++], slotW: slot,     along: slotCenter, isHalf: false });
       }
@@ -876,8 +902,32 @@ function populateRoom(group, surfaces, items, videoEntries) {
       p.mw = p.mh * p.ar;
     }
 
+    // Layout doubled pairs: each unit = label + labelGap + frame + image +
+    // frame. Pack two units left-aligned with PAIR_INTER_GAP between them,
+    // then center the whole pair on slotCenter. Eliminates the inside-gap
+    // label collision that wide-aspect pairs otherwise produced.
+    for (let i = 0; i + 1 < placements.length; i++) {
+      const p = placements[i], q = placements[i + 1];
+      if (p.pairId === undefined || p.pairId !== q.pairId) continue;
+      const pDec = decisionsFor(p.item);
+      const qDec = decisionsFor(q.item);
+      const pExt = pDec.hasFrame ? pDec.frameT : 0;
+      const qExt = qDec.hasFrame ? qDec.frameT : 0;
+      const HALF_LABEL_GAP = 0.10;
+      const u1 = p.mw + 2 * pExt + HALF_LABEL_GAP + PLACARD_W;
+      const u2 = q.mw + 2 * qExt + HALF_LABEL_GAP + PLACARD_W;
+      const total = u1 + PAIR_INTER_GAP + u2;
+      const origin = p.pairCenter - total / 2;
+      // The label sits at mesh-local +X = "smaller along" side of the
+      // image, so within each unit the label comes first along the axis.
+      // Image center = unit_left + PLACARD_W + labelGap + frameT + mw/2
+      p.along = origin + PLACARD_W + HALF_LABEL_GAP + pExt + p.mw / 2;
+      q.along = origin + u1 + PAIR_INTER_GAP + PLACARD_W + HALF_LABEL_GAP + qExt + q.mw / 2;
+      i++; // skip the partner
+    }
+
     for (const __placement of placements) {
-      const { item, slotW, along, isHalf, mw, mh, ar } = __placement;
+      const { item, slotW, along, isHalf, pairSide, mw, mh, ar } = __placement;
       const groupDec = decisionsFor(item);
       const cy = surf.height < ROOM_H ? surf.height / 2 : MEDIA_BASE_HEIGHT;
 
@@ -891,11 +941,8 @@ function populateRoom(group, surfaces, items, videoEntries) {
       const fx = px + surf.normal.x * offset;
       const fz = pz + surf.normal.z * offset;
 
-      // Half-size (doubled-slot) media gets a red tint so they're visually
-      // identifiable while we iterate on the layout.
-      const tintHex = isHalf ? 0xff6666 : 0xffffff;
       const sideMat  = new THREE.MeshLambertMaterial({ color: 0xffffff });
-      const frontMat = new THREE.MeshBasicMaterial({ color: tintHex, toneMapped: false });
+      const frontMat = new THREE.MeshBasicMaterial({ color: 0xffffff, toneMapped: false });
       const boxMats  = [sideMat, sideMat, sideMat, sideMat, frontMat, sideMat];
       const boxGeom  = new THREE.BoxGeometry(mw, mh, FRAME_DEPTH);
       const mesh = new THREE.Mesh(boxGeom, boxMats);
@@ -960,7 +1007,7 @@ function populateRoom(group, surfaces, items, videoEntries) {
 
       const applyMap = (tex) => {
         frontMat.map = tex;
-        frontMat.color.setHex(tintHex);
+        frontMat.color.setHex(0xffffff);
         frontMat.needsUpdate = true;
       };
       if (item.thumb) {
@@ -970,8 +1017,6 @@ function populateRoom(group, surfaces, items, videoEntries) {
           applyMap(tex);
         });
       }
-      const PLACARD_W = 0.32;
-      const PLACARD_H = PLACARD_W * (PLACARD_PX_H / PLACARD_PX_W);
       let placard = null;
 
       if (item.type === 'video') {
@@ -998,7 +1043,8 @@ function populateRoom(group, surfaces, items, videoEntries) {
           if (!vw || !vh) return;
           const realAr = vw / vh;
           if (Math.abs(realAr - ar) < 0.05) return; // declared was close enough
-          let newW = Math.min(MEDIA_MAX_W, slotW * 0.8);
+          const slotMul = isHalf ? 0.6 : 0.8;
+          let newW = Math.min(MEDIA_MAX_W, slotW * slotMul);
           let newH = newW / realAr;
           if (newH > MEDIA_MAX_H) {
             newH = MEDIA_MAX_H;
@@ -1006,13 +1052,12 @@ function populateRoom(group, surfaces, items, videoEntries) {
           }
           mesh.geometry.dispose();
           mesh.geometry = new THREE.BoxGeometry(newW, newH, FRAME_DEPTH);
-          mw = newW; mh = newH;
           if (placard) {
             const _ext = groupDec.hasFrame ? groupDec.frameT : 0;
             const _gap = isHalf ? 0.10 : 0.16;
-            placard.position.x = mw / 2 + _ext + PLACARD_W / 2 + _gap;
+            placard.position.x = newW / 2 + _ext + PLACARD_W / 2 + _gap;
           }
-          mesh.userData.relayoutFrame?.(mw, mh);
+          mesh.userData.relayoutFrame?.(newW, newH);
         });
         // Recreate the WebGPU VideoTexture only on a *real* dimension change
         // mid-playback (HLS variant switch). The initial 0→N metadata load
@@ -1044,8 +1089,11 @@ function populateRoom(group, surfaces, items, videoEntries) {
 
       const placardTex = makePlacardTexture(item);
       const placardGeom = new THREE.PlaneGeometry(PLACARD_W, PLACARD_H);
-      const placardMat = new THREE.MeshStandardMaterial({
-        map: placardTex, roughness: 1, metalness: 0,
+      // Basic + toneMapped:false so the placard renders the canvas exactly
+      // as drawn — IBL was making the light background hotter and the
+      // tonemap was eroding the dark text.
+      const placardMat = new THREE.MeshBasicMaterial({
+        map: placardTex, toneMapped: false,
       });
       placard = new THREE.Mesh(placardGeom, placardMat);
       // Push the placard back to the wall surface (5mm proud to avoid z-
@@ -1068,13 +1116,14 @@ function populateRoom(group, surfaces, items, videoEntries) {
   return { planes, artworks, itemsConsumed: idx };
 }
 
-function createGalleryManager(scene, paginator, initialItems, onCountChange) {
+function createGalleryManager(scene, paginator, initialItems, onCountChange, pbr) {
   scene.background = new THREE.Color(0x161616);
   const ambient = new THREE.AmbientLight(0xffffff, 1.8);
   scene.add(ambient);
 
-  const wallTex  = loadPBRSet(`${ASSET_BASE}textures/plastered_wall_04_1k/textures/plastered_wall_04`, 1);
-  const floorTex = loadPBRSet(`${ASSET_BASE}textures/concrete_floor_worn_001_1k/textures/concrete_floor_worn_001`, 1);
+  // PBR texture sets are loaded by init() and passed in so we can wait
+  // for everything before showing the engage prompt.
+  const { wallTex, floorTex } = pbr;
   const wallMat = new THREE.MeshStandardMaterial({
     map: wallTex.diff, normalMap: wallTex.norm, aoMap: wallTex.arm,
     aoMapIntensity: 0.5,
@@ -1086,7 +1135,7 @@ function createGalleryManager(scene, paginator, initialItems, onCountChange) {
     roughnessMap: floorTex.arm, metalnessMap: floorTex.arm,
     metalness: 0, roughness: 1,
   });
-  const ceilMat = new THREE.MeshLambertMaterial({ color: 0xffffff });
+  const ceilMat = new THREE.MeshBasicMaterial({ color: 0xeeeeee });
   const mats = { wallMat, floorMat, ceilMat };
 
   // Feed buffer
@@ -1177,7 +1226,7 @@ function createGalleryManager(scene, paginator, initialItems, onCountChange) {
   function buildSlot(feedIdx) {
     const m = metaFor(feedIdx);
     const groupZ = feedIdxCenterZ(feedIdx);
-    const { group, surfaces } = buildRoom({
+    const { group, surfaces, wallAABBs } = buildRoom({
       type: m.type,
       partitionSide: m.partitionSide,
       openNorth: m.openNorth,
@@ -1219,6 +1268,7 @@ function createGalleryManager(scene, paginator, initialItems, onCountChange) {
       artworks: pop.artworks,
       videoEntries,
       people,
+      wallAABBs,
       get type()    { return metaFor(feedIdx).type; },
       get d()       { return ROOM_DEPTHS[metaFor(feedIdx).type]; },
       get centerZ() { return group.position.z; },
@@ -1276,7 +1326,12 @@ function createGalleryManager(scene, paginator, initialItems, onCountChange) {
       if (!slot.people) continue;
       for (const person of slot.people) {
         person.getWorldPosition(_personWorldPos);
-        const d = camera.position.distanceTo(_personWorldPos);
+        // Horizontal distance only — camera is at eye height (1.6m) and
+        // people are at floor, so a constant y-offset would otherwise pad
+        // the 3D distance and skew fade thresholds.
+        const dx = camera.position.x - _personWorldPos.x;
+        const dz = camera.position.z - _personWorldPos.z;
+        const d = Math.sqrt(dx * dx + dz * dz);
         let opacity;
         if (d <= PEOPLE_FADE_NEAR) opacity = 0;
         else if (d >= PEOPLE_FADE_FAR) opacity = 1;
@@ -1284,9 +1339,9 @@ function createGalleryManager(scene, paginator, initialItems, onCountChange) {
           const t = (d - PEOPLE_FADE_NEAR) / (PEOPLE_FADE_FAR - PEOPLE_FADE_NEAR);
           opacity = t * t * (3 - 2 * t); // smoothstep
         }
-        const last = person.userData.lastOpacity;
-        if (last !== undefined && Math.abs(opacity - last) < 0.005) continue;
-        person.userData.lastOpacity = opacity;
+        // Always update — the previous "skip if delta < 0.005" early-out
+        // could lock a person at a near-zero opacity (e.g. 0.0018) when the
+        // explicit branch tried to snap to 0, leaving a faint ghost.
         person.visible = opacity > 0.001;
         for (const m of person.userData.fadeMaterials) m.opacity = opacity;
       }
@@ -1324,6 +1379,32 @@ function createGalleryManager(scene, paginator, initialItems, onCountChange) {
     updatePeopleFade(camera);
   }
 
+  // Push the player out of any wall AABB they overlap with their radius.
+  // Walks current ± 1 slots so wall sections at slot boundaries collide
+  // correctly on either side.
+  function collide(pos, radius) {
+    const lo = Math.max(0, currentSlotIdx - 1);
+    const hi = Math.min(slots.length - 1, currentSlotIdx + 1);
+    for (let i = lo; i <= hi; i++) {
+      const s = slots[i];
+      if (!s.wallAABBs) continue;
+      for (const a of s.wallAABBs) {
+        const minX = a.minX - radius, maxX = a.maxX + radius;
+        const minZ = a.minZ - radius, maxZ = a.maxZ + radius;
+        if (pos.x <= minX || pos.x >= maxX || pos.z <= minZ || pos.z >= maxZ) continue;
+        const penLeft  = pos.x - minX;
+        const penRight = maxX - pos.x;
+        const penFront = pos.z - minZ;
+        const penBack  = maxZ - pos.z;
+        const minPen = Math.min(penLeft, penRight, penFront, penBack);
+        if      (minPen === penLeft)  pos.x = minX;
+        else if (minPen === penRight) pos.x = maxX;
+        else if (minPen === penFront) pos.z = minZ;
+        else                          pos.z = maxZ;
+      }
+    }
+  }
+
   return {
     get planes() {
       const out = [];
@@ -1339,6 +1420,7 @@ function createGalleryManager(scene, paginator, initialItems, onCountChange) {
     ambient,
     startPos: new THREE.Vector3(2.5, 1.6, -20),
     update,
+    collide,
   };
 }
 
@@ -1402,7 +1484,7 @@ async function init({ items, paginator }) {
   // PMREMGenerator stays alive so we can process HDRs on demand when the user
   // picks one from the GUI. Each environment is cached after first compute.
   const pmremGenerator = new THREE.PMREMGenerator(renderer);
-  const rgbeLoader = new RGBELoader();
+  const hdrLoader = new HDRLoader();
   const envCache = new Map(); // key → THREE.Texture
 
   const ENV_OPTIONS = {
@@ -1416,31 +1498,39 @@ async function init({ items, paginator }) {
   function applyEnv(key) {
     if (envCache.has(key)) {
       scene.environment = envCache.get(key);
-      return;
+      return Promise.resolve();
     }
     if (key === 'procedural') {
       const tex = pmremGenerator.fromScene(new RoomEnvironment(), 0.04).texture;
       envCache.set(key, tex);
       scene.environment = tex;
-      return;
+      return Promise.resolve();
     }
-    rgbeLoader.load(key, (hdr) => {
-      const tex = pmremGenerator.fromEquirectangular(hdr).texture;
-      hdr.dispose();
-      envCache.set(key, tex);
-      scene.environment = tex;
+    return new Promise((resolve, reject) => {
+      hdrLoader.load(key, (hdr) => {
+        const tex = pmremGenerator.fromEquirectangular(hdr).texture;
+        hdr.dispose();
+        envCache.set(key, tex);
+        scene.environment = tex;
+        resolve();
+      }, undefined, reject);
     });
   }
 
-  // Default environment
+  // Wait for all heavy assets — env, PBR sets — before building the scene
+  // so the user doesn't get dumped into a half-textured gallery.
   const DEFAULT_ENV = `${ASSET_BASE}hdr/studio_small_08_1k.hdr`;
-  applyEnv(DEFAULT_ENV);
+  const [, wallTex, floorTex] = await Promise.all([
+    applyEnv(DEFAULT_ENV),
+    loadPBRSet(`${ASSET_BASE}textures/plastered_wall_04_1k/textures/plastered_wall_04`, 1),
+    loadPBRSet(`${ASSET_BASE}textures/concrete_floor_worn_001_1k/textures/concrete_floor_worn_001`, 1),
+  ]);
 
   const built = MODE === 'carousel'
     ? buildCarousel(scene, items)
     : createGalleryManager(scene, paginator, items, (n, exhausted) => {
         countEl.textContent = exhausted ? `${n}` : `${n}+`;
-      });
+      }, { wallTex, floorTex });
   const ambient = built.ambient || null;
   camera.position.copy(built.startPos);
   // Face -Z by default (looking into the gallery / into the carousel center)
@@ -1462,6 +1552,7 @@ async function init({ items, paginator }) {
   const AUDIO_FULL_DIST    = 1; // metres — full volume within this distance
   const AUDIO_SILENT_DIST  = 5; // metres — silent at or beyond this distance
   const _videoWorldPos = new THREE.Vector3();
+  const _videoForward  = new THREE.Vector3();
   const lightPool = [];
 
   function rebuildPool(size) {
@@ -1593,13 +1684,24 @@ async function init({ items, paginator }) {
   ambienceAudio.volume = 0.25;
   const footstepsAudio = new Audio(`${ASSET_BASE}sfx/footsteps.mp3`);
   footstepsAudio.loop = true;
-  footstepsAudio.volume = 0.5;
+  // Start silent; volume lerps toward FOOTSTEPS_TARGET_VOL while moving.
+  footstepsAudio.volume = 0;
+  const FOOTSTEPS_TARGET_VOL = 0.5;
+  const FOOTSTEPS_FADE_RATE  = 10; // ~100ms ramp
 
   const controls = new PointerLockControls(camera, renderer.domElement);
   // Only the engage prompt locks; clicks on the form/input do not.
   engagePrompt.addEventListener('click', () => controls.lock());
+  let overlayFaded = false;
   controls.addEventListener('lock', () => {
-    overlayEl.hidden = true;
+    if (!overlayFaded) {
+      overlayFaded = true;
+      // Fade the black overlay to 0 over 0.7s, then take it out of layout.
+      overlayEl.style.opacity = '0';
+      setTimeout(() => { overlayEl.hidden = true; }, 350);
+    } else {
+      overlayEl.hidden = true;
+    }
     if (toggles.sound) ambienceAudio.play().catch(() => {});
   });
   // TEMP: keep the scene visible after Esc so the GUI is interactable.
@@ -1653,7 +1755,7 @@ async function init({ items, paginator }) {
     document.body.appendChild(stats.dom);
   }
 
-  const clock = new THREE.Clock();
+  const timer = new Timer();
   // Cap render to 60fps even on high-refresh-rate displays. Browsers RAF at the
   // display's native rate (often 120Hz) which makes any frame variance feel
   // jerky; a fixed 60Hz target keeps pacing consistent.
@@ -1663,13 +1765,15 @@ async function init({ items, paginator }) {
     requestAnimationFrame(animate);
     if (now - lastFrameMs < TARGET_FRAME_MS - 0.5) return;
     lastFrameMs = now;
-    const dt = Math.min(clock.getDelta(), 0.1);
+    timer.update();
+    const dt = Math.min(timer.getDelta(), 0.1);
     if (controls.isLocked) {
       const speed = MOVE_SPEED * (keys.shift ? SPRINT_MULT : 1) * dt;
       if (keys.w) controls.moveForward(speed);
       if (keys.s) controls.moveForward(-speed);
       if (keys.a) controls.moveRight(-speed);
       if (keys.d) controls.moveRight(speed);
+      if (MODE === 'gallery') built.collide?.(camera.position, 0.3);
     }
     if (MODE === 'gallery') {
       built.update?.(dt, camera);
@@ -1681,7 +1785,11 @@ async function init({ items, paginator }) {
     const moving = controls.isLocked && (keys.w || keys.s || keys.a || keys.d);
     if (toggles.sound) {
       if (controls.isLocked && ambienceAudio.paused) ambienceAudio.play().catch(() => {});
-      if (moving) {
+      // Lerp footsteps volume toward target so start/stop is a quick fade.
+      const targetVol = moving ? FOOTSTEPS_TARGET_VOL : 0;
+      const k = Math.min(1, dt * FOOTSTEPS_FADE_RATE);
+      footstepsAudio.volume += (targetVol - footstepsAudio.volume) * k;
+      if (footstepsAudio.volume > 0.01) {
         if (footstepsAudio.paused) footstepsAudio.play().catch(() => {});
       } else if (!footstepsAudio.paused) {
         footstepsAudio.pause();
@@ -1689,6 +1797,7 @@ async function init({ items, paginator }) {
     } else {
       if (!ambienceAudio.paused) ambienceAudio.pause();
       if (!footstepsAudio.paused) footstepsAudio.pause();
+      footstepsAudio.volume = 0;
     }
 
     // Per-video volume falloff. Browsers block unmuted autoplay until a user
@@ -1703,8 +1812,15 @@ async function init({ items, paginator }) {
           if (video.paused) video.play().catch(() => {});
           if (toggles.sound) {
             mesh.getWorldPosition(_videoWorldPos);
+            // Mute when the camera is behind the video plane (not looking
+            // at the front face) — otherwise a piece on the back of a
+            // partition can leak audio through the wall.
+            mesh.getWorldDirection(_videoForward);
+            const fx = camera.position.x - _videoWorldPos.x;
+            const fz = camera.position.z - _videoWorldPos.z;
+            const inFront = (_videoForward.x * fx + _videoForward.z * fz) > 0;
             const d = camera.position.distanceTo(_videoWorldPos);
-            const vol = Math.max(0, Math.min(1,
+            const vol = !inFront ? 0 : Math.max(0, Math.min(1,
               1 - (d - AUDIO_FULL_DIST) / (AUDIO_SILENT_DIST - AUDIO_FULL_DIST)
             ));
             if (vol > 0) {
@@ -1772,9 +1888,13 @@ async function loadFor(input, { pushUrl = true } = {}) {
       return;
     }
     countEl.textContent = paginator.isExhausted ? `${items.length}` : `${items.length}+`;
+    setOverlayStatus('Building scene…');
     await init({ items, paginator });
     sceneLoaded = true;
-    // Swap modal content from form → engage prompt
+    // Swap modal content from form → engage prompt: hide the title and
+    // input so only the CTA + hint show.
+    const titleEl = overlayEl.querySelector('h1');
+    if (titleEl) titleEl.hidden = true;
     form.hidden = true;
     setOverlayStatus('');
     engagePrompt.hidden = false;
@@ -1803,13 +1923,9 @@ form.addEventListener('submit', (e) => {
 });
 
 // On first load, honor ?handle=… so links are shareable (matches 2D gallery).
-// If no URL param, the input stays empty and waits for user input.
+// We pre-fill the input but don't auto-load — user clicks Go to start.
 (() => {
   const initial = new URL(window.location).searchParams.get('handle');
-  if (initial) {
-    handleInput.value = initial;
-    loadFor(initial, { pushUrl: false });
-  } else {
-    handleInput.focus();
-  }
+  if (initial) handleInput.value = initial;
+  handleInput.focus();
 })();
