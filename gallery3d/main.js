@@ -1,6 +1,6 @@
 import * as THREE from 'three/webgpu';
 const { Timer } = THREE;
-import { mrt, output, normalView, pass, mix, uniform } from 'three/tsl';
+import { mrt, output, normalView, pass, mix, uniform, screenUV, smoothstep, vec2 } from 'three/tsl';
 import { ao } from 'three/addons/tsl/display/GTAONode.js';
 import { denoise } from 'three/addons/tsl/display/DenoiseNode.js';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
@@ -26,6 +26,8 @@ const overlayStatus = document.getElementById('overlay-status');
 const engagePrompt = document.getElementById('engage-prompt');
 const form         = document.getElementById('form');
 const handleInput  = document.getElementById('handle');
+const repostsRow   = document.getElementById('reposts-row');
+const repostsToggle = document.getElementById('reposts');
 const countEl      = document.getElementById('count');
 const infoEl       = document.getElementById('info');
 const escHintEl    = document.getElementById('esc-hint');
@@ -116,8 +118,9 @@ function setOverlayStatus(msg, kind) {
 }
 
 // ---- Bluesky fetch (paginated) ----
-function parseFeedToMedia(feed, out) {
+function parseFeedToMedia(feed, out, includeReposts = true) {
   for (const fi of feed) {
+    if (!includeReposts && fi.reason?.$type === 'app.bsky.feed.defs#reasonRepost') continue;
     const post = fi.post;
     let embed = post.embed;
     if (!embed) continue;
@@ -161,7 +164,7 @@ function parseFeedToMedia(feed, out) {
   }
 }
 
-function createPaginator(source) {
+function createPaginator(source, { includeReposts = true } = {}) {
   let cursor = null;
   let exhausted = false;
 
@@ -185,7 +188,7 @@ function createPaginator(source) {
     cursor = data.cursor || null;
     if (!cursor) exhausted = true;
     const out = [];
-    parseFeedToMedia(data.feed, out);
+    parseFeedToMedia(data.feed, out, includeReposts);
     return out;
   }
 
@@ -193,8 +196,8 @@ function createPaginator(source) {
 }
 
 // Pull pages until we have at least minCount items (or the feed runs out).
-async function fetchInitialMedia(source, minCount) {
-  const paginator = createPaginator(source);
+async function fetchInitialMedia(source, minCount, opts) {
+  const paginator = createPaginator(source, opts);
   const items = [];
   while (items.length < minCount && !paginator.isExhausted) {
     const more = await paginator.fetchNextPage();
@@ -402,31 +405,23 @@ function wrapTextLines(ctx, text, maxWidth, maxLines) {
   return lines;
 }
 
+// Lucide "square-arrow-out-up-right" — same icon the 2D gallery uses on the
+// post-link button. Drawn via Path2D from the SVG path data on a 24×24
+// viewBox; ctx.scale rescales to the requested icon size.
 function drawExternalLinkIcon(ctx, x, y, size, color = '#111') {
   ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(size / 24, size / 24);
   ctx.strokeStyle = color;
   ctx.lineWidth = 2;
   ctx.lineCap = 'round';
   ctx.lineJoin = 'round';
-  // Box (open top-right corner)
-  ctx.beginPath();
-  ctx.moveTo(x + size * 0.55, y + size * 0.1);
-  ctx.lineTo(x + size * 0.15, y + size * 0.1);
-  ctx.lineTo(x + size * 0.15, y + size * 0.85);
-  ctx.lineTo(x + size * 0.85, y + size * 0.85);
-  ctx.lineTo(x + size * 0.85, y + size * 0.45);
-  ctx.stroke();
-  // Arrow square (top-right)
-  ctx.beginPath();
-  ctx.moveTo(x + size * 0.5, y + size * 0.1);
-  ctx.lineTo(x + size * 0.9, y + size * 0.1);
-  ctx.lineTo(x + size * 0.9, y + size * 0.5);
-  ctx.stroke();
-  // Arrow diagonal
-  ctx.beginPath();
-  ctx.moveTo(x + size * 0.4, y + size * 0.6);
-  ctx.lineTo(x + size * 0.9, y + size * 0.1);
-  ctx.stroke();
+  const p = new Path2D(
+    'M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6 ' +
+    'M15 3h6v6 ' +
+    'M10 14L21 3'
+  );
+  ctx.stroke(p);
   ctx.restore();
 }
 
@@ -817,7 +812,10 @@ function populateRoom(group, surfaces, items, videoEntries) {
   // (to compute unit footprints) and per-item placement, so hoist them.
   const PLACARD_W = 0.32;
   const PLACARD_H = PLACARD_W * (PLACARD_PX_H / PLACARD_PX_W);
-  const PAIR_INTER_GAP = 0.10; // gap between two units inside a doubled slot
+  // Single padding value used on BOTH sides of every label — matches the
+  // frame→label gap inside each unit and the unit→unit gap in the middle of
+  // a doubled pair, so the middle label has identical padding on each side.
+  const HALF_LABEL_PAD = 0.10;
 
   // Per-post-group decisions: items from the same bsky post share frame
   // styling and a target height, so a multi-image post reads as a set.
@@ -902,10 +900,11 @@ function populateRoom(group, surfaces, items, videoEntries) {
       p.mw = p.mh * p.ar;
     }
 
-    // Layout doubled pairs: each unit = label + labelGap + frame + image +
-    // frame. Pack two units left-aligned with PAIR_INTER_GAP between them,
-    // then center the whole pair on slotCenter. Eliminates the inside-gap
-    // label collision that wide-aspect pairs otherwise produced.
+    // Layout doubled pairs: each unit = label + pad + frame + image +
+    // frame. Pack two units left-aligned with HALF_LABEL_PAD between them
+    // (same value as the in-unit frame→label pad), then center on
+    // slotCenter. Both sides of the middle label end up with identical
+    // padding to their neighbouring frame.
     for (let i = 0; i + 1 < placements.length; i++) {
       const p = placements[i], q = placements[i + 1];
       if (p.pairId === undefined || p.pairId !== q.pairId) continue;
@@ -913,16 +912,16 @@ function populateRoom(group, surfaces, items, videoEntries) {
       const qDec = decisionsFor(q.item);
       const pExt = pDec.hasFrame ? pDec.frameT : 0;
       const qExt = qDec.hasFrame ? qDec.frameT : 0;
-      const HALF_LABEL_GAP = 0.10;
-      const u1 = p.mw + 2 * pExt + HALF_LABEL_GAP + PLACARD_W;
-      const u2 = q.mw + 2 * qExt + HALF_LABEL_GAP + PLACARD_W;
-      const total = u1 + PAIR_INTER_GAP + u2;
+      // Inter-unit gap (image1 frame → central label) is doubled, so the
+      // central label has more breathing room *before* it. The label→
+      // image2 gap stays at the standard HALF_LABEL_PAD.
+      const interUnitPad = HALF_LABEL_PAD * 2;
+      const u1 = p.mw + 2 * pExt + HALF_LABEL_PAD + PLACARD_W;
+      const u2 = q.mw + 2 * qExt + HALF_LABEL_PAD + PLACARD_W;
+      const total = u1 + interUnitPad + u2;
       const origin = p.pairCenter - total / 2;
-      // The label sits at mesh-local +X = "smaller along" side of the
-      // image, so within each unit the label comes first along the axis.
-      // Image center = unit_left + PLACARD_W + labelGap + frameT + mw/2
-      p.along = origin + PLACARD_W + HALF_LABEL_GAP + pExt + p.mw / 2;
-      q.along = origin + u1 + PAIR_INTER_GAP + PLACARD_W + HALF_LABEL_GAP + qExt + q.mw / 2;
+      p.along = origin + PLACARD_W + HALF_LABEL_PAD + pExt + p.mw / 2;
+      q.along = origin + u1 + interUnitPad + PLACARD_W + HALF_LABEL_PAD + qExt + q.mw / 2;
       i++; // skip the partner
     }
 
@@ -1054,7 +1053,7 @@ function populateRoom(group, surfaces, items, videoEntries) {
           mesh.geometry = new THREE.BoxGeometry(newW, newH, FRAME_DEPTH);
           if (placard) {
             const _ext = groupDec.hasFrame ? groupDec.frameT : 0;
-            const _gap = isHalf ? 0.10 : 0.16;
+            const _gap = isHalf ? HALF_LABEL_PAD : 0.16;
             placard.position.x = newW / 2 + _ext + PLACARD_W / 2 + _gap;
           }
           mesh.userData.relayoutFrame?.(newW, newH);
@@ -1100,7 +1099,7 @@ function populateRoom(group, surfaces, items, videoEntries) {
       // fighting). Local -Z is toward the wall — the artwork sits
       // WALL_GAP + FRAME_DEPTH/2 out from the wall, so we negate that.
       const frameSideExt = groupDec.hasFrame ? groupDec.frameT : 0;
-      const labelGap = isHalf ? 0.10 : 0.16;
+      const labelGap = isHalf ? HALF_LABEL_PAD : 0.16;
       placard.position.set(
         mw / 2 + frameSideExt + PLACARD_W / 2 + labelGap,
         0,
@@ -1130,6 +1129,9 @@ function createGalleryManager(scene, paginator, initialItems, onCountChange, pbr
     roughnessMap: wallTex.arm, metalnessMap: wallTex.arm,
     metalness: 0, roughness: 1,
   });
+  // 1.2× brightness multiplier on the diffuse map (THREE.Color isn't
+  // clamped to [0,1], so values >1 brighten in linear space).
+  wallMat.color.setRGB(1.2, 1.2, 1.2);
   const floorMat = new THREE.MeshStandardMaterial({
     map: floorTex.diff, normalMap: floorTex.norm, aoMap: floorTex.arm,
     roughnessMap: floorTex.arm, metalnessMap: floorTex.arm,
@@ -1477,8 +1479,21 @@ async function init({ items, paginator }) {
   const softenedAO = denoisedAO.pow(0.5);
   const composited = mix(sceneColor, sceneColor.mul(softenedAO), aoEnabled);
 
+  // Vignette: darken corners based on distance from screen center.
+  // smoothstep(inner, outer, dist) → 0 inside `inner`, 1 past `outer`,
+  // smoothly interpolated between. Distance maxes at sqrt(0.5)≈0.707 in
+  // the corners. Final factor is multiplied by VIGNETTE_STRENGTH so we
+  // only darken to 1 − strength at the very corners.
+  const VIGNETTE_INNER    = 0.45;
+  const VIGNETTE_OUTER    = 0.75;
+  const VIGNETTE_STRENGTH = 0.45;
+  const vignette = smoothstep(VIGNETTE_INNER, VIGNETTE_OUTER,
+    screenUV.distance(vec2(0.5, 0.5))
+  ).mul(VIGNETTE_STRENGTH);
+  const withVignette = composited.mul(vignette.oneMinus());
+
   const postProcessing = new THREE.RenderPipeline(renderer);
-  postProcessing.outputNode = composited;
+  postProcessing.outputNode = withVignette;
 
   // ---- IBL environment ----
   // PMREMGenerator stays alive so we can process HDRs on demand when the user
@@ -1681,7 +1696,12 @@ async function init({ items, paginator }) {
   // Loaded eagerly; playback gated on engage click (browser autoplay policy).
   const ambienceAudio = new Audio(`${ASSET_BASE}sfx/ambience.mp3`);
   ambienceAudio.loop = true;
-  ambienceAudio.volume = 0.25;
+  ambienceAudio.volume = 0;
+  const AMBIENCE_TARGET_VOL = 0.25;
+  // Lock gain: 1 while pointer is locked, 0 when Esc'd. Lerps for smooth
+  // audio fade in/out and is multiplied into ambience + video volumes.
+  let lockGain = 0;
+  const LOCK_FADE_RATE = 4; // ~250ms
   const footstepsAudio = new Audio(`${ASSET_BASE}sfx/footsteps.mp3`);
   footstepsAudio.loop = true;
   // Start silent; volume lerps toward FOOTSTEPS_TARGET_VOL while moving.
@@ -1692,21 +1712,29 @@ async function init({ items, paginator }) {
   const controls = new PointerLockControls(camera, renderer.domElement);
   // Only the engage prompt locks; clicks on the form/input do not.
   engagePrompt.addEventListener('click', () => controls.lock());
-  let overlayFaded = false;
+  // Lock → fade the overlay to fully transparent (out of layout after
+  // transition). Unlock (Esc) → bring it back at 0.5 dim so the gallery
+  // stays visible behind the click-to-enter prompt. Both transitions are
+  // driven by the CSS `transition: opacity` on #overlay.
+  // Drive the backdrop's --overlay-bg-opacity (a ::before pseudo-element)
+  // so the panel contents (CTA, hint) stay at full opacity even when the
+  // backdrop dims.
+  // Backdrop and panel content fade together. On unlock (Esc) the backdrop
+  // settles at 0.7 dim while the content goes back to full opacity so the
+  // click-to-enter prompt is fully readable over the dim gallery.
   controls.addEventListener('lock', () => {
-    if (!overlayFaded) {
-      overlayFaded = true;
-      // Fade the black overlay to 0 over 0.7s, then take it out of layout.
-      overlayEl.style.opacity = '0';
-      setTimeout(() => { overlayEl.hidden = true; }, 350);
-    } else {
-      overlayEl.hidden = true;
-    }
+    overlayEl.style.setProperty('--overlay-bg-opacity', '0');
+    overlayEl.style.setProperty('--overlay-content-opacity', '0');
+    setTimeout(() => { overlayEl.hidden = true; }, 350);
     if (toggles.sound) ambienceAudio.play().catch(() => {});
   });
-  // TEMP: keep the scene visible after Esc so the GUI is interactable.
-  // Click on the canvas to re-engage pointer lock.
-  // controls.addEventListener('unlock', () => { overlayEl.hidden = false; });
+  controls.addEventListener('unlock', () => {
+    overlayEl.hidden = false;
+    requestAnimationFrame(() => {
+      overlayEl.style.setProperty('--overlay-bg-opacity', '0.7');
+      overlayEl.style.setProperty('--overlay-content-opacity', '1');
+    });
+  });
   renderer.domElement.addEventListener('click', () => {
     if (!controls.isLocked) controls.lock();
   });
@@ -1780,12 +1808,21 @@ async function init({ items, paginator }) {
       updateLightPool(dt);
     }
 
-    // Footsteps when moving + ambience while engaged. Both gated on the
-    // sound toggle so muting also kills these.
+    // Lerp lockGain toward 1 (locked) or 0 (Esc'd). Drives a smooth fade
+    // on ambience + video audio when the user enters or releases pointer
+    // lock. Footsteps cut by themselves because `moving` requires lock.
+    const lockTarget = controls.isLocked ? 1 : 0;
+    lockGain += (lockTarget - lockGain) * Math.min(1, dt * LOCK_FADE_RATE);
+
     const moving = controls.isLocked && (keys.w || keys.s || keys.a || keys.d);
     if (toggles.sound) {
-      if (controls.isLocked && ambienceAudio.paused) ambienceAudio.play().catch(() => {});
-      // Lerp footsteps volume toward target so start/stop is a quick fade.
+      ambienceAudio.volume = AMBIENCE_TARGET_VOL * lockGain;
+      if (lockGain > 0.005) {
+        if (ambienceAudio.paused) ambienceAudio.play().catch(() => {});
+      } else if (!ambienceAudio.paused) {
+        ambienceAudio.pause();
+      }
+      // Footsteps lerp on their own toward FOOTSTEPS_TARGET_VOL or 0.
       const targetVol = moving ? FOOTSTEPS_TARGET_VOL : 0;
       const k = Math.min(1, dt * FOOTSTEPS_FADE_RATE);
       footstepsAudio.volume += (targetVol - footstepsAudio.volume) * k;
@@ -1795,46 +1832,50 @@ async function init({ items, paginator }) {
         footstepsAudio.pause();
       }
     } else {
+      ambienceAudio.volume = 0;
       if (!ambienceAudio.paused) ambienceAudio.pause();
       if (!footstepsAudio.paused) footstepsAudio.pause();
       footstepsAudio.volume = 0;
     }
 
-    // Per-video volume falloff. Browsers block unmuted autoplay until a user
-    // gesture, so once you've engaged (clicked) the videos can sound.
-    // Also: pause videos that aren't in the current room — HLS decode is
-    // expensive and the player can't see them.
+    // Keep all videos playing whenever the global Video toggle is on —
+    // pausing/resuming HLS streams turned out to be unreliable (a video
+    // would sometimes stay frozen on its last frame after the user left
+    // and re-entered the room). We mute them when out of the current
+    // room instead. Trade a bit of CPU for reliability.
     if (galleryVideos.length) {
       const currentGroup = MODE === 'gallery' ? built.currentGroup : null;
       for (const { video, mesh } of galleryVideos) {
+        if (!toggles.video) {
+          if (!video.paused) video.pause();
+          if (!video.muted) video.muted = true;
+          continue;
+        }
+        if (video.paused) video.play().catch(() => {});
+
         const inCurrent = MODE !== 'gallery' || mesh.parent === currentGroup;
-        if (inCurrent && toggles.video) {
-          if (video.paused) video.play().catch(() => {});
-          if (toggles.sound) {
-            mesh.getWorldPosition(_videoWorldPos);
-            // Mute when the camera is behind the video plane (not looking
-            // at the front face) — otherwise a piece on the back of a
-            // partition can leak audio through the wall.
-            mesh.getWorldDirection(_videoForward);
-            const fx = camera.position.x - _videoWorldPos.x;
-            const fz = camera.position.z - _videoWorldPos.z;
-            const inFront = (_videoForward.x * fx + _videoForward.z * fz) > 0;
-            const d = camera.position.distanceTo(_videoWorldPos);
-            const vol = !inFront ? 0 : Math.max(0, Math.min(1,
-              1 - (d - AUDIO_FULL_DIST) / (AUDIO_SILENT_DIST - AUDIO_FULL_DIST)
-            ));
-            if (vol > 0) {
-              if (video.muted) video.muted = false;
-              video.volume = vol;
-            } else if (!video.muted) {
-              video.muted = true;
-            }
+        if (inCurrent && toggles.sound) {
+          mesh.getWorldPosition(_videoWorldPos);
+          // Mute when the camera is behind the video plane (not looking
+          // at the front face) — otherwise a piece on the back of a
+          // partition can leak audio through the wall.
+          mesh.getWorldDirection(_videoForward);
+          const fx = camera.position.x - _videoWorldPos.x;
+          const fz = camera.position.z - _videoWorldPos.z;
+          const inFront = (_videoForward.x * fx + _videoForward.z * fz) > 0;
+          const d = camera.position.distanceTo(_videoWorldPos);
+          const baseVol = !inFront ? 0 : Math.max(0, Math.min(1,
+            1 - (d - AUDIO_FULL_DIST) / (AUDIO_SILENT_DIST - AUDIO_FULL_DIST)
+          ));
+          const vol = baseVol * lockGain;
+          if (vol > 0.005) {
+            if (video.muted) video.muted = false;
+            video.volume = vol;
           } else if (!video.muted) {
             video.muted = true;
           }
-        } else {
-          if (!video.paused) video.pause();
-          if (!video.muted) video.muted = true;
+        } else if (!video.muted) {
+          video.muted = true;
         }
       }
     }
@@ -1882,7 +1923,8 @@ async function loadFor(input, { pushUrl = true } = {}) {
     // Gallery: ~12 items per room × SLOT_COUNT, with margin so initial slots
     // all get fully populated before async paginator catches up.
     const minCount = MODE === 'carousel' ? MAX_ITEMS : 70;
-    const { paginator, items } = await fetchInitialMedia(source, minCount);
+    const includeReposts = repostsToggle.checked;
+    const { paginator, items } = await fetchInitialMedia(source, minCount, { includeReposts });
     if (items.length === 0 && paginator.isExhausted) {
       setOverlayStatus('No media found.', 'notice');
       return;
@@ -1896,8 +1938,14 @@ async function loadFor(input, { pushUrl = true } = {}) {
     const titleEl = overlayEl.querySelector('h1');
     if (titleEl) titleEl.hidden = true;
     form.hidden = true;
+    if (repostsRow) repostsRow.hidden = true;
     setOverlayStatus('');
+    overlayEl.classList.add('engage-mode');
+    // Reveal the engage prompt with a fade-in: start at opacity 0, then
+    // bump to 1 next frame so the CSS transition runs.
+    engagePrompt.style.opacity = '0';
     engagePrompt.hidden = false;
+    requestAnimationFrame(() => { engagePrompt.style.opacity = '1'; });
     infoEl.hidden = false;
     escHintEl.hidden = false;
     reticleEl.hidden = false;
@@ -1928,4 +1976,9 @@ form.addEventListener('submit', (e) => {
   const initial = new URL(window.location).searchParams.get('handle');
   if (initial) handleInput.value = initial;
   handleInput.focus();
+  // Fade the panel (title + form) in. CSS default is opacity 0 so the
+  // form doesn't flash before this kicks the transition.
+  requestAnimationFrame(() => {
+    overlayEl.style.setProperty('--overlay-content-opacity', '1');
+  });
 })();

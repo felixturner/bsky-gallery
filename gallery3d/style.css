@@ -12,17 +12,36 @@ html, body {
 canvas { display: block; }
 
 /* ---------- Modal overlay ---------- */
-/* Solid black so the gallery is hidden until the user clicks "enter".
-   Engage click fades opacity to 0 then sets [hidden]. */
+/* The black backdrop lives on a ::before pseudo-element with opacity
+   controlled via the --overlay-bg-opacity CSS variable, so the panel
+   contents (form, click-to-enter) stay at full opacity even when the
+   backdrop dims to 0.7 on Esc. */
 #overlay {
   position: fixed;
   inset: 0;
-  background: #000;
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 50;
+  isolation: isolate;
+}
+#overlay::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background: #000;
+  opacity: var(--overlay-bg-opacity, 1);
   transition: opacity 0.35s ease-out;
+  z-index: -1;
+  pointer-events: none;
+}
+/* Panel contents fade with the same timing as the backdrop, so the click-
+   to-enter text doesn't pop after the black has gone. Default opacity is
+   0 so the title + form fade in on first page load (JS bumps the var to
+   1 once it boots). */
+#overlay > .panel {
+  opacity: var(--overlay-content-opacity, 0);
+  transition: opacity 0.5s ease-out;
 }
 #overlay[hidden] { display: none; }
 
@@ -49,6 +68,20 @@ canvas { display: block; }
   justify-content: center;
 }
 #form[hidden] { display: none; }
+
+#reposts-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.9rem;
+  font-size: 0.85rem;
+  color: #aaa;
+  letter-spacing: 0.02em;
+  cursor: pointer;
+  user-select: none;
+}
+#reposts-row[hidden] { display: none; }
+#reposts-row input { accent-color: #fff; }
 
 #handle {
   flex: 1;
@@ -88,7 +121,16 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 #overlay-status.notice { color: #fff; font-size: 1rem; }
 #overlay-status.error  { color: #ff6b6b; }
 
-#engage-prompt { margin-top: 2.5rem; cursor: pointer; }
+#engage-prompt {
+  margin-top: 2.5rem;
+  cursor: pointer;
+  transition: opacity 0.5s ease-out;
+}
+
+/* Engage mode: form + title + status are hidden, leave only the CTA + hint
+   centred in the panel without phantom spacing from the cleared status. */
+#overlay.engage-mode #overlay-status { display: none; }
+#overlay.engage-mode #engage-prompt { margin-top: 0; }
 #engage-prompt .cta {
   margin: 0;
   font-family: 'Fraunces', Georgia, serif;
@@ -132,5 +174,9 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
   transform: translate(-50%, -50%);
   pointer-events: none;
   z-index: 5;
-  box-shadow: 0 0 0 1px rgba(0, 0, 0, 0.6);
+  /* Soft black glow on both the outer and inner edges so the ring stays
+     legible against any background. */
+  box-shadow:
+    0 0 3px 0 rgba(0, 0, 0, 0.45),
+    inset 0 0 3px 0 rgba(0, 0, 0, 0.45);
 }
