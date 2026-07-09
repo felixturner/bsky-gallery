@@ -74,6 +74,45 @@ async function resolveHandleToDid(handle) {
   return (await res.json()).did;
 }
 
+// Fetch a human-readable name for the source (profile display name, feed name, list name).
+export async function fetchSourceName(parsed) {
+  try {
+    if (parsed.type === 'handle') {
+      const url = new URL(`${XRPC}/app.bsky.actor.getProfile`);
+      url.searchParams.set('actor', parsed.actor);
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      const data = await res.json();
+      return data.displayName || data.handle || null;
+    }
+    const did = parsed.uri
+      ? parsed.uri.split('/')[2]
+      : await resolveHandleToDid(parsed.handle);
+    if (parsed.type === 'feed') {
+      const collection = 'app.bsky.feed.generator';
+      const rkey = parsed.rkey ?? parsed.uri.split('/').pop();
+      const uri = `at://${did}/${collection}/${rkey}`;
+      const url = new URL(`${XRPC}/app.bsky.feed.getFeedGenerator`);
+      url.searchParams.set('feed', uri);
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      return (await res.json()).view?.displayName ?? null;
+    }
+    if (parsed.type === 'list') {
+      const collection = 'app.bsky.graph.list';
+      const rkey = parsed.rkey ?? parsed.uri.split('/').pop();
+      const uri = `at://${did}/${collection}/${rkey}`;
+      const url = new URL(`${XRPC}/app.bsky.graph.getList`);
+      url.searchParams.set('list', uri);
+      url.searchParams.set('limit', '1');
+      const res = await fetch(url);
+      if (!res.ok) return null;
+      return (await res.json()).list?.name ?? null;
+    }
+  } catch { return null; }
+  return null;
+}
+
 export async function resolveSource(parsed) {
   if (parsed.type === 'handle') return { type: 'handle', uri: parsed.actor };
   if (parsed.uri) return parsed;

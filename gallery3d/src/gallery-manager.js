@@ -48,6 +48,33 @@ const FRAME_COLOR_DARK  = 0x111111;
 // ---- People fade smoothing ----
 const _personWorldPos = new THREE.Vector3();
 
+// ---- Clockwise ordering for the Next/Back tour ----
+// Rank a room's artworks by the angle of their *viewer* point (a standoff in
+// front of each piece) around the room centre. atan2(x, z) sweeps 0 at +Z
+// round through +X, so the perimeter is visited clockwise (viewed from above)
+// and partition pieces fall in beside the wall they face. Consecutive pieces
+// are physical neighbours, so Next/Back hops stay short and in-room.
+const _artWorldPos = new THREE.Vector3();
+const NAV_VIEW_DIST = 2;
+function clockwiseOrder(slot) {
+  const cz = slot.centerZ;
+  const ranked = slot.artworks
+    .map((m) => {
+      const p = m.getWorldPosition(_artWorldPos);
+      const n = m.userData.faceNormal;
+      const vx = p.x + n.x * NAV_VIEW_DIST;
+      const vz = (p.z + n.z * NAV_VIEW_DIST) - cz;
+      let a = Math.atan2(vx, vz);
+      if (a < 0) a += Math.PI * 2;
+      return { m, a };
+    })
+    .sort((p, q) => p.a - q.a)
+    .map((o) => o.m);
+  // Both directions start near the north (entry) door; reversing the
+  // ascending sweep gives the counter-clockwise spin for this room.
+  return slot.rotateCW ? ranked : ranked.reverse();
+}
+
 // Shared unit-cube geometry for every artwork frame box across the entire
 // scene. Each frame mesh just sets its own scale, so adding/removing frames
 // during room recycle is a single Vector3.set instead of building +
@@ -194,6 +221,11 @@ function populateRoom(group, surfaces, items, videoEntries) {
       mesh.position.set(fx, cy, fz - group.position.z);
       mesh.lookAt(fx + surf.normal.x, cy, (fz - group.position.z) + surf.normal.z);
       mesh.userData.item = item;
+      // Room-facing normal (unit, in XZ) — the mobile tour uses this to place
+      // the camera squarely in front of the piece.
+      mesh.userData.faceNormal = surf.normal.clone();
+      // Room centre Z — the tour uses this to detect room-to-room steps.
+      mesh.userData.roomCenterZ = group.position.z;
 
       // Spotlight anchor + target stored in WORLD coords. lightAnchor sits
       // forward of and above the artwork; lightTarget is the surface centre.
@@ -416,6 +448,8 @@ export function createGalleryManager(scene, paginator, initialItems, onCountChan
       openSouth: true,
       itemRange: null,
       isTerminal: false,
+      // Each room's Next/Back sweep spins a random direction (sticky per room).
+      rotateCW: Math.random() < 0.5,
     };
     feedIdxMeta.set(feedIdx, m);
     return m;
@@ -521,6 +555,7 @@ export function createGalleryManager(scene, paginator, initialItems, onCountChan
       get d()       { return ROOM_DEPTHS[metaFor(feedIdx).type]; },
       get centerZ() { return group.position.z; },
       get terminal(){ return metaFor(feedIdx).isTerminal; },
+      get rotateCW(){ return metaFor(feedIdx).rotateCW; },
     };
   }
 
@@ -654,6 +689,23 @@ export function createGalleryManager(scene, paginator, initialItems, onCountChan
     },
     get currentArtworks() {
       return slots[currentSlotIdx]?.artworks ?? [];
+    },
+    // Every loaded artwork, rooms in feedIdx order and, within each room,
+    // clockwise by position (not feed order) so Next/Back walks the room.
+    get orderedArtworks() {
+      const out = [];
+      for (const s of slots) out.push(...clockwiseOrder(s));
+      return out;
+    },
+    // Wall AABBs for every loaded room, in world coords — the tour's A*
+    // pathfinder needs the full set so a route spanning several rooms (through
+    // the doorways) has complete wall data, not just the current room ±1.
+    get allWallAABBs() {
+      const out = [];
+      for (const s of slots) {
+        if (s.wallAABBs) for (const a of s.wallAABBs) out.push(a);
+      }
+      return out;
     },
     get currentGroup() {
       return slots[currentSlotIdx]?.group ?? null;

@@ -23,16 +23,25 @@ import Stats from 'three/addons/libs/stats.module.js';
 import { GUI } from 'three/addons/libs/lil-gui.module.min.js';
 
 import {
-  parseSource, resolveSource, fetchInitialMedia,
+  parseSource, resolveSource, fetchInitialMedia, fetchSourceName,
 } from './src/bsky-feed.js';
 import { setMaxAniso, loadPBRSet, galleryVideos } from './src/textures.js';
 import { loadPeopleTemplates } from './src/people.js';
 import { createGalleryManager } from './src/gallery-manager.js';
 import { buildCarousel } from './src/carousel.js';
+import { createTour } from './src/tour.js';
 
 // ---- Config ----
 const MOVE_SPEED  = 4;
 const SPRINT_MULT = 2.5;
+// Pre-fills the handle field when no ?list=/?feed=/?handle= is supplied, so
+// the gallery is one tap from loading on a fresh visit.
+const DEFAULT_BOOT_INPUT = 'https://bsky.app/profile/felixturner.bsky.social/lists/3mkolikdciy2c';
+// Drag-look sensitivity (rad/pixel) is derived from the camera FOV + viewport
+// so a finger-drag tracks the content ~1:1; see computeLookSens(). It depends
+// only on FOV (fixed) and height, so it's recomputed on resize, not per frame.
+const LOOK_DRAG_THRESH = 6;                     // px before a press counts as a drag (vs tap)
+const LOOK_MAX_PITCH  = Math.PI * 40 / 180;     // clamp vertical look to ±40°
 const CAROUSEL_INITIAL_COUNT = 50;
 const GALLERY_INITIAL_COUNT  = 70; // enough for SLOT_COUNT rooms + margin
 
@@ -48,12 +57,23 @@ const countEl       = document.getElementById('count');
 const infoEl        = document.getElementById('info');
 const escHintEl     = document.getElementById('esc-hint');
 const reticleEl     = document.getElementById('reticle');
+const navControls   = document.getElementById('nav-controls');
+const navPrev       = document.getElementById('nav-prev');
+const navNext       = document.getElementById('nav-next');
+const tapHintEl     = document.getElementById('tap-hint');
 
 const ASSET_BASE = import.meta.env.BASE_URL; // '/' in dev, '/bsky-gallery/3d/' in prod
 const MODE = (new URL(window.location).searchParams.get('mode') || 'gallery');
 const DEV_MODE = new URL(window.location).searchParams.get('dev') === 'true';
 
 const _qs = new URL(window.location).searchParams;
+// Mobile/touch nav (approach #3): a yaw look-joystick + tap-a-picture-to-walk
+// guided tour instead of pointer-lock + WASD. Auto-on for touch; forced on for
+// desktop testing with ?nav=joystick (or the legacy ?nav=buttons alias).
+const NAV_TOUR = _qs.get('nav') === 'joystick' || _qs.get('nav') === 'buttons' ||
+  (typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches);
+// The guided tour only applies to the room-based gallery (not legacy carousel).
+const USE_TOUR = NAV_TOUR && MODE === 'gallery';
 const initialDPR = parseFloat(_qs.get('dpr')) || 1;
 const initialAA  = _qs.get('aa') !== 'false';
 
@@ -63,6 +83,16 @@ function setOverlayStatus(msg, kind) {
   overlayStatus.classList.toggle('error',  kind === 'error');
 }
 
+// On touch, go fullscreen to drop the browser chrome (URL/status bars). Must be
+// called from a user gesture (the engage tap). No-ops where unsupported — e.g.
+// iPhone Safari has no element fullscreen, so there it's "Add to Home Screen".
+function requestFullscreenOnMobile() {
+  if (!matchMedia('(pointer: coarse)').matches) return;
+  const el = document.documentElement;
+  const req = el.requestFullscreen || el.webkitRequestFullscreen;
+  try { req?.call(el)?.catch?.(() => {}); } catch {}
+}
+
 // ============================================================
 // Scene setup
 // ============================================================
@@ -70,6 +100,14 @@ async function init({ items, paginator }) {
   const scene = new THREE.Scene();
 
   const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 200);
+  // Radians of camera rotation per pixel dragged, matched to the projection so
+  // the point under the finger stays put (exact at screen centre). Recomputed
+  // on resize/orientation change. Square pixels → same value for x and y.
+  let lookSens = 0.003;
+  const computeLookSens = () => {
+    lookSens = 2 * Math.tan((camera.fov * Math.PI / 180) / 2) / Math.min(innerWidth, innerHeight);
+  };
+  computeLookSens();
   const renderer = new THREE.WebGPURenderer({ antialias: initialAA });
   renderer.setSize(innerWidth, innerHeight);
   renderer.setPixelRatio(initialDPR);
@@ -288,29 +326,134 @@ async function init({ items, paginator }) {
   const _videoWorldPos = new THREE.Vector3();
   const _videoForward  = new THREE.Vector3();
 
+  // Mute everything while the tab is hidden. The render loop (and the audio
+  // update it drives) is paused by the browser when backgrounded, so we can't
+  // rely on it — handle it directly on visibilitychange, which still fires.
+  // On re-show, the resumed loop's updateAudio restores volumes.
+  let tabHidden = document.hidden;
+  function muteForHidden() {
+    if (!ambienceAudio.paused) ambienceAudio.pause();
+    if (!footstepsAudio.paused) footstepsAudio.pause();
+    for (const { video } of galleryVideos) if (!video.muted) video.muted = true;
+  }
+  document.addEventListener('visibilitychange', () => {
+    tabHidden = document.hidden;
+    if (tabHidden) muteForHidden();
+  });
+
   // ---- Pointer-lock + overlay fade ----
   const controls = new PointerLockControls(camera, renderer.domElement);
-  // Engage prompt locks; clicks on the form/input do not. Backdrop and
-  // panel content fade together. On unlock (Esc) the backdrop settles at
-  // 0.7 dim while the content goes back to full opacity so the click-to-
-  // enter prompt is fully readable over the dim gallery.
-  engagePrompt.addEventListener('click', () => controls.lock());
-  controls.addEventListener('lock', () => {
+
+  // ---- Mobile guided tour (approach #3: drag-to-look + tap-to-walk) ----
+  // On touch (or ?nav=joystick) we skip pointer-lock entirely: tapping enters,
+  // dragging anywhere rotates the view (orbit-style), and a tap on a picture
+  // walks the camera to it.
+  const tour = createTour({ camera, built });
+  // Debug handle for the forced-tour test path (?nav=…) and dev mode; not
+  // exposed to ordinary touch sessions.
+  if (DEV_MODE || _qs.get('nav')) window.__dbg = { tour, camera, built };
+  let tourEntered = false;
+  function fadeOverlayOut() {
     overlayEl.style.setProperty('--overlay-bg-opacity', '0');
     overlayEl.style.setProperty('--overlay-content-opacity', '0');
     setTimeout(() => { overlayEl.hidden = true; }, 350);
+  }
+  function enterTour() {
+    if (tourEntered) return;
+    tourEntered = true;
+    requestFullscreenOnMobile();
+    fadeOverlayOut();
+    tapHintEl.hidden = false;
+    // Fade the tap hint out after a few seconds once they've had a look.
+    setTimeout(() => { tapHintEl.style.opacity = '0'; }, 4500);
     if (toggles.sound) ambienceAudio.play().catch(() => {});
-  });
-  controls.addEventListener('unlock', () => {
-    overlayEl.hidden = false;
-    requestAnimationFrame(() => {
-      overlayEl.style.setProperty('--overlay-bg-opacity', '0.7');
-      overlayEl.style.setProperty('--overlay-content-opacity', '1');
+    tour.enter(); // frame the nearest piece so there's an initial subject
+  }
+
+  // Tap a picture → walk to it. Raycast from the tap point; a placard hit
+  // resolves to its parent artwork. Ignored mid-walk so taps don't queue.
+  const _selectRay = new THREE.Raycaster();
+  const _selectNdc = new THREE.Vector2();
+  function selectAt(clientX, clientY) {
+    if (tour.active) return;
+    _selectNdc.set((clientX / innerWidth) * 2 - 1, -(clientY / innerHeight) * 2 + 1);
+    _selectRay.setFromCamera(_selectNdc, camera);
+    const hits = _selectRay.intersectObjects(built.planes, false);
+    if (!hits.length) return;
+    const obj = hits[0].object;
+    if (obj.userData.isPlacard) {
+      tour.goToPlacard(obj);
+      return;
+    }
+    if (!obj.userData.faceNormal) return;
+    if (tour.parkedMesh === obj) {
+      // Already in front of this artwork — toggle near ↔ close.
+      tour.zoomTo(obj, tour.parkedLevel === 'near' ? 'close' : 'near');
+    } else {
+      tour.goToMesh(obj);
+    }
+  }
+
+  // Drag anywhere to look (yaw free, pitch clamped); a tap that didn't drag
+  // is a select. We track yaw/pitch as a YXZ euler so there's no roll and
+  // pitch can be clamped; it's re-seeded from the camera at each drag start so
+  // it composes correctly after a glide reorients the camera.
+  const _lookEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+  let dragPid = null, dragMoved = false, lastX = 0, lastY = 0, downX = 0, downY = 0;
+  function onLookDown(e) {
+    if (!tourEntered) { enterTour(); return; }
+    dragPid = e.pointerId; dragMoved = false;
+    downX = lastX = e.clientX; downY = lastY = e.clientY;
+    _lookEuler.setFromQuaternion(camera.quaternion, 'YXZ');
+  }
+  function onLookMove(e) {
+    if (e.pointerId !== dragPid) return;
+    if (!dragMoved && Math.hypot(e.clientX - downX, e.clientY - downY) > LOOK_DRAG_THRESH) {
+      dragMoved = true;
+    }
+    if (dragMoved && !tour.active) {
+      // Content-follows-finger (orbit-style): drag right → view turns left,
+      // drag down → look up.
+      _lookEuler.y += (e.clientX - lastX) * lookSens;
+      _lookEuler.x = Math.max(-LOOK_MAX_PITCH, Math.min(LOOK_MAX_PITCH,
+        _lookEuler.x + (e.clientY - lastY) * lookSens));
+      camera.quaternion.setFromEuler(_lookEuler);
+    }
+    lastX = e.clientX; lastY = e.clientY;
+  }
+  function onLookUp(e) {
+    if (e.pointerId !== dragPid) return;
+    dragPid = null;
+    if (!dragMoved) selectAt(e.clientX, e.clientY); // tap, not a drag → walk
+  }
+
+  if (USE_TOUR) {
+    engagePrompt.addEventListener('click', enterTour);
+    renderer.domElement.addEventListener('pointerdown', onLookDown);
+    window.addEventListener('pointermove', onLookMove, { passive: true });
+    window.addEventListener('pointerup', onLookUp);
+    window.addEventListener('pointercancel', () => { dragPid = null; });
+  } else {
+    // Desktop: engage prompt locks; clicks on the form/input do not. Backdrop
+    // and panel content fade together. On unlock (Esc) the backdrop settles at
+    // 0.7 dim while the content goes back to full opacity so the click-to-
+    // enter prompt is fully readable over the dim gallery.
+    engagePrompt.addEventListener('click', () => controls.lock());
+    controls.addEventListener('lock', () => {
+      fadeOverlayOut();
+      if (toggles.sound) ambienceAudio.play().catch(() => {});
     });
-  });
-  renderer.domElement.addEventListener('click', () => {
-    if (!controls.isLocked) controls.lock();
-  });
+    controls.addEventListener('unlock', () => {
+      overlayEl.hidden = false;
+      requestAnimationFrame(() => {
+        overlayEl.style.setProperty('--overlay-bg-opacity', '0.7');
+        overlayEl.style.setProperty('--overlay-content-opacity', '1');
+      });
+    });
+    renderer.domElement.addEventListener('click', () => {
+      if (!controls.isLocked) controls.lock();
+    });
+  }
 
   // ---- Keyboard ----
   const keys = { w: false, a: false, s: false, d: false, shift: false };
@@ -362,8 +505,12 @@ async function init({ items, paginator }) {
     timer.update();
     const dt = Math.min(timer.getDelta(), 0.1);
 
-    // Movement
-    if (controls.isLocked) {
+    // Movement: mobile tour drives the camera itself; desktop uses WASD.
+    if (USE_TOUR) {
+      // While walking, the glide owns the camera; when parked, drag-look (handled
+      // in the pointer events) owns it.
+      if (tourEntered && tour.active) tour.update(dt);
+    } else if (controls.isLocked) {
       const speed = MOVE_SPEED * (keys.shift ? SPRINT_MULT : 1) * dt;
       if (keys.w) controls.moveForward(speed);
       if (keys.s) controls.moveForward(-speed);
@@ -377,8 +524,8 @@ async function init({ items, paginator }) {
     }
 
     // Lock-gain lerp drives ambience + video audio fade in/out together.
-    // Footsteps cut by themselves because `moving` requires lock.
-    const lockTarget = controls.isLocked ? 1 : 0;
+    // Footsteps cut by themselves because `moving` requires being "entered".
+    const lockTarget = (USE_TOUR ? tourEntered : controls.isLocked) ? 1 : 0;
     lockGain += (lockTarget - lockGain) * Math.min(1, dt * LOCK_FADE_RATE);
     updateAudio(dt);
 
@@ -389,7 +536,10 @@ async function init({ items, paginator }) {
 
   // Audio update extracted for readability — runs every frame.
   function updateAudio(dt) {
-    const moving = controls.isLocked && (keys.w || keys.s || keys.a || keys.d);
+    if (tabHidden) { muteForHidden(); return; }
+    const moving = USE_TOUR
+      ? (tourEntered && tour.walking)
+      : (controls.isLocked && (keys.w || keys.s || keys.a || keys.d));
     if (toggles.sound) {
       ambienceAudio.volume = AMBIENCE_TARGET_VOL * lockGain;
       if (lockGain > 0.005) {
@@ -472,6 +622,7 @@ async function init({ items, paginator }) {
     camera.aspect = innerWidth / innerHeight;
     camera.updateProjectionMatrix();
     renderer.setSize(innerWidth, innerHeight);
+    computeLookSens(); // viewport height changed → re-match drag sensitivity
   });
 }
 
@@ -553,7 +704,7 @@ function readBootInput() {
     const m = v.match(/^([^/]+)\/(.+)$/);
     if (m) return `https://bsky.app/profile/${m[1]}/${kind === 'list' ? 'lists' : 'feed'}/${m[2]}`;
   }
-  return qs.get('handle') || '';
+  return qs.get('handle') || DEFAULT_BOOT_INPUT;
 }
 
 async function loadFor(input, { pushUrl = true } = {}) {
@@ -596,14 +747,31 @@ async function loadFor(input, { pushUrl = true } = {}) {
     if (repostsRow) repostsRow.hidden = true;
     setOverlayStatus('');
     overlayEl.classList.add('engage-mode');
+    // Mobile tour gets its own CTA copy; the reticle + ESC hint are
+    // desktop-only (pointer-lock concepts that don't apply on touch).
+    if (USE_TOUR) {
+      const cta  = engagePrompt.querySelector('.cta');
+      const hint = engagePrompt.querySelector('.hint');
+      if (cta)  cta.textContent  = 'Tap to Enter';
+      if (hint) hint.textContent = 'Tap a picture to walk to it · drag to look around';
+    }
     // Reveal the engage prompt with a fade-in: start at opacity 0, then
     // bump to 1 next frame so the CSS transition runs.
     engagePrompt.style.opacity = '0';
     engagePrompt.hidden = false;
     requestAnimationFrame(() => { engagePrompt.style.opacity = '1'; });
+    fetchSourceName(parsed).then((name) => {
+      const el = document.getElementById('gallery-name');
+      if (el && name) {
+        const titled = name.replace(/\w\S*/g, w => w[0].toUpperCase() + w.slice(1).toLowerCase());
+        el.textContent = `${titled} Gallery`;
+      }
+    });
     infoEl.hidden = false;
-    escHintEl.hidden = false;
-    reticleEl.hidden = false;
+    if (!USE_TOUR) {
+      escHintEl.hidden = false;
+      reticleEl.hidden = false;
+    }
   } catch (err) {
     if (err.message === 'PROFILE_NOT_FOUND') {
       setOverlayStatus('Bluesky profile not found', 'notice');
@@ -618,8 +786,7 @@ async function loadFor(input, { pushUrl = true } = {}) {
 
 form.addEventListener('submit', (e) => {
   e.preventDefault();
-  const raw = handleInput.value.trim();
-  if (!raw) return;
+  const raw = handleInput.value.trim() || handleInput.placeholder;
   const parsed = parseSource(raw);
   if (parsed.type === 'handle') handleInput.value = parsed.actor;
   loadFor(raw);
@@ -629,7 +796,12 @@ form.addEventListener('submit', (e) => {
 // We pre-fill the input but don't auto-load — user clicks Go to start.
 (() => {
   const initial = readBootInput();
-  if (initial) handleInput.value = initial;
+  const qs = new URL(window.location).searchParams;
+  const fromUrl = qs.has('handle') || qs.has('list') || qs.has('feed');
+  if (initial) {
+    if (fromUrl) handleInput.value = initial;
+    else handleInput.placeholder = initial;
+  }
   handleInput.focus();
   // Fade the panel (title + form) in. CSS default is opacity 0 so the form
   // doesn't flash before this kicks the transition.
