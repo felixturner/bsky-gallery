@@ -164,11 +164,12 @@ async function init({ items, paginator }) {
   const envCache = DEV_MODE ? new Map() : null;
 
   const ENV_OPTIONS = DEV_MODE ? {
-    'Procedural Room':    'procedural',
-    'Solitude Interior':  `${ASSET_BASE}hdr/solitude_interior_1k.hdr`,
-    'Photo Studio':       `${ASSET_BASE}hdr/photo_studio_01_1k.hdr`,
-    'Studio Small (1k)':  `${ASSET_BASE}hdr/studio_small_08_1k.hdr`,
-    'Studio Small (2k)':  `${ASSET_BASE}hdr/studio_small_08_2k.hdr`,
+    'Procedural Room':       'procedural',
+    'Debris Basement':       `${ASSET_BASE}hdr/debris_basement_corridor_1k.hdr`,
+    'Solitude Interior':     `${ASSET_BASE}hdr/solitude_interior_1k.hdr`,
+    'Photo Studio':          `${ASSET_BASE}hdr/photo_studio_01_1k.hdr`,
+    'Studio Small (1k)':     `${ASSET_BASE}hdr/studio_small_08_1k.hdr`,
+    'Studio Small (2k)':     `${ASSET_BASE}hdr/studio_small_08_2k.hdr`,
   } : null;
   function applyEnv(key) {
     if (envCache?.has(key)) {
@@ -212,97 +213,19 @@ async function init({ items, paginator }) {
   // Face -Z by default (looking into the gallery / into the carousel center)
   if (MODE === 'gallery') camera.lookAt(-3, 1.6, built.startPos.z);
 
-  // ---- Spotlight pool (gallery mode only) ----
-  // Forward-renderer is unhappy with many lights, so we keep a fixed-size
-  // pool of SpotLights and retarget them each frame to the nearest visible
-  // artworks.
-  const lightSettings = { maxLights: 6, intensity: 12 };
   const toggles = {
-    spotlights: false,
-    gtao:       true,
-    sound:      true,
-    video:      true,
+    gtao:  true,
+    sound: true,
+    video: true,
   };
-  const lightPool = [];
-  function rebuildPool(size) {
-    for (const l of lightPool) {
-      scene.remove(l);
-      scene.remove(l.target);
-      l.dispose();
-    }
-    lightPool.length = 0;
-    for (let i = 0; i < size; i++) {
-      const l = new THREE.SpotLight(0xffffff, 0, 8, Math.PI / 7, 0.4, 1.6);
-      scene.add(l);
-      scene.add(l.target);
-      lightPool.push(l);
-    }
-  }
 
   if (MODE === 'gallery') {
-    if (toggles.spotlights) rebuildPool(lightSettings.maxLights);
     aoEnabled.value = toggles.gtao ? 1 : 0;
     if (DEV_MODE) buildDevGui({
       gui: new GUI({ title: 'Render' }),
       renderer, scene, ambient, aoPass, aoEnabled, applyEnv,
-      toggles, lightSettings, ENV_OPTIONS, DEFAULT_ENV, rebuildPool,
+      toggles, ENV_OPTIONS, DEFAULT_ENV,
     });
-  }
-
-  // ---- Spotlight assignment + intensity lerp ----
-  const LIGHT_LERP_RATE = 8;       // ~125ms fade in/out
-  function updateLightPool(dt) {
-    if (lightPool.length === 0) return;
-    // Gallery mode: only artworks in the room the player is currently in
-    // are spotlight candidates. Carousel: use the full set.
-    const candidates = MODE === 'gallery'
-      ? built.currentArtworks
-      : (built.artworks || []);
-    // Proximity-only: nearest N artworks get lights, regardless of camera
-    // facing — avoids pop-in/out at frustum edges.
-    const visible = candidates.slice().sort((a, b) =>
-      a.position.distanceToSquared(camera.position) -
-      b.position.distanceToSquared(camera.position)
-    );
-    const topVisible = new Set(visible.slice(0, lightPool.length));
-    // Step 1: keep slots that are still on top, mark others for fade-out.
-    const claimed = new Set();
-    for (const slot of lightPool) {
-      if (slot.userData.artwork && topVisible.has(slot.userData.artwork)) {
-        claimed.add(slot.userData.artwork);
-        slot.userData.targetIntensity = lightSettings.intensity;
-      } else {
-        slot.userData.targetIntensity = 0;
-      }
-    }
-    // Step 2: release slots whose intensity has fully decayed.
-    for (const slot of lightPool) {
-      if (slot.userData.targetIntensity === 0 && slot.intensity < 0.02) {
-        slot.userData.artwork = null;
-      }
-    }
-    // Step 3: assign newly-visible artworks to free slots.
-    const pendingAssign = [...topVisible].filter((a) => !claimed.has(a));
-    for (const slot of lightPool) {
-      if (pendingAssign.length === 0) break;
-      if (!slot.userData.artwork) {
-        const a = pendingAssign.shift();
-        slot.userData.artwork = a;
-        slot.position.copy(a.userData.lightAnchor);
-        slot.target.position.copy(a.userData.lightTarget);
-        slot.target.updateMatrixWorld();
-        slot.angle    = a.userData.lightAngle;
-        slot.distance = a.userData.lightDistance;
-        slot.userData.targetIntensity = lightSettings.intensity;
-        slot.intensity = 0; // start at 0, lerp up
-      }
-    }
-    // Step 4: smoothly lerp every slot's intensity toward its target.
-    const k = Math.min(1, dt * LIGHT_LERP_RATE);
-    for (const slot of lightPool) {
-      const target = slot.userData.targetIntensity ?? 0;
-      slot.intensity += (target - slot.intensity) * k;
-    }
   }
 
   // ---- Audio: ambience + footsteps ----
@@ -520,7 +443,6 @@ async function init({ items, paginator }) {
     }
     if (MODE === 'gallery') {
       built.update?.(dt, camera);
-      updateLightPool(dt);
     }
 
     // Lock-gain lerp drives ambience + video audio fade in/out together.
@@ -626,11 +548,10 @@ async function init({ items, paginator }) {
   });
 }
 
-// Dev-only render GUI. Exposed knobs: DPR, AA, spotlights, GTAO, sound,
+// Dev-only render GUI. Exposed knobs: DPR, AA, GTAO, sound,
 // video, ambient, environment + intensity, GTAO sub-folder.
 function buildDevGui({ gui, renderer, scene, ambient, aoPass, aoEnabled,
-                       applyEnv, toggles, lightSettings, ENV_OPTIONS,
-                       DEFAULT_ENV, rebuildPool }) {
+                       applyEnv, toggles, ENV_OPTIONS, DEFAULT_ENV }) {
   const renderSettings = { dpr: initialDPR, aa: initialAA };
   gui.add(renderSettings, 'dpr', 0.5, 2, 0.25).name('DPR')
     .onChange((v) => renderer.setPixelRatio(v));
@@ -641,16 +562,10 @@ function buildDevGui({ gui, renderer, scene, ambient, aoPass, aoEnabled,
       window.location.assign(url.toString());
     });
 
-  gui.add(toggles, 'spotlights').name('Spotlights')
-    .onChange((v) => rebuildPool(v ? lightSettings.maxLights : 0));
   gui.add(toggles, 'gtao').name('GTAO')
     .onChange((v) => { aoEnabled.value = v ? 1 : 0; });
   gui.add(toggles, 'sound').name('Sound');
   gui.add(toggles, 'video').name('Video Playback');
-
-  gui.add(lightSettings, 'maxLights', 0, 50, 1).name('Max Spotlights')
-    .onFinishChange((v) => { if (toggles.spotlights) rebuildPool(v); });
-  gui.add(lightSettings, 'intensity', 0, 50, 0.5).name('Spotlight Intensity');
 
   if (ambient) gui.add(ambient, 'intensity', 0, 5, 0.05).name('Ambient');
   const envSelect = { current: DEFAULT_ENV };

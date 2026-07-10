@@ -227,20 +227,6 @@ function populateRoom(group, surfaces, items, videoEntries) {
       // Room centre Z — the tour uses this to detect room-to-room steps.
       mesh.userData.roomCenterZ = group.position.z;
 
-      // Spotlight anchor + target stored in WORLD coords. lightAnchor sits
-      // forward of and above the artwork; lightTarget is the surface centre.
-      // Cone angle and distance scale with media size so a halo fits.
-      const mediaSize = Math.max(mw, mh);
-      const forwardDist = 1.4 + mediaSize * 0.2;
-      const headroom    = 0.5 + mediaSize * 0.4;
-      mesh.userData.lightAnchor = new THREE.Vector3(
-        fx + surf.normal.x * forwardDist,
-        cy + mh / 2 + headroom,
-        fz + surf.normal.z * forwardDist
-      );
-      mesh.userData.lightTarget   = new THREE.Vector3(fx, cy, fz);
-      mesh.userData.lightAngle    = Math.min(Math.PI / 4, Math.atan2(mediaSize * 0.7, forwardDist));
-      mesh.userData.lightDistance = 5 + mediaSize * 1.5;
       group.add(mesh);
       planes.push(mesh);
       artworks.push(mesh);
@@ -405,8 +391,6 @@ export function createGalleryManager(scene, paginator, initialItems, onCountChan
     roughnessMap: wallTex.arm, metalnessMap: wallTex.arm,
     metalness: 0, roughness: 1,
   });
-  // 1.2× brightness multiplier on the diffuse map (THREE.Color isn't clamped
-  // to [0,1], so values >1 brighten in linear space).
   wallMat.color.setRGB(1.2, 1.2, 1.2);
   const floorMat = new THREE.MeshStandardMaterial({
     map: floorTex.diff, normalMap: floorTex.norm, aoMap: floorTex.arm,

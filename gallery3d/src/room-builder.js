@@ -6,7 +6,10 @@ import * as THREE from 'three/webgpu';
 
 // Room is 14m wide; depth varies by type. ROOM_H + ROOM_DEPTHS are also
 // referenced by gallery-manager (slot positioning, in-room cy fallback).
-const ROOM_W = 14;
+const ROOM_W_SMALL = 14;
+// Extra width added only to the narrow-corridor side of big rooms so its
+// corridor matches the small room's half-width (7m). Equals ROOM_W_SMALL * 0.18.
+const NARROW_EXTRA = 2.52;
 export const ROOM_H = 5;
 export const ROOM_DEPTHS = { small: 12, big: 16 };
 
@@ -68,6 +71,16 @@ export function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ },
   const { wallMat, floorMat, ceilMat } = mats;
   const d = ROOM_DEPTHS[type];
 
+  // Big rooms are asymmetric: the narrow corridor side (xSign direction) gets
+  // NARROW_EXTRA metres of extra width while the wide side stays put.
+  // Small rooms are symmetric; xSign is irrelevant but harmless.
+  const xSign = partitionSide === 'right' ? +1 : -1;
+  const halfW = ROOM_W_SMALL / 2;                              // 7
+  const xPos =  type === 'big' ? xSign > 0 ? halfW + NARROW_EXTRA : halfW : halfW;   // positive side
+  const xNeg = -(type === 'big' ? xSign < 0 ? halfW + NARROW_EXTRA : halfW : halfW); // negative side
+  const totalW = xPos - xNeg;           // 18 for big, 14 for small
+  const cx     = (xPos + xNeg) / 2;    // floor/ceiling centre offset (2 for big, 0 for small)
+
   const group = new THREE.Group();
   group.position.set(0, 0, groupZ);
   const surfaces = [];
@@ -80,26 +93,24 @@ export function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ },
     });
   };
 
-  makeRoomBox(group, ROOM_W, 0.1, d, 0, -0.05, 0, floorMat, FLOOR_TILE_M);
+  makeRoomBox(group, totalW, 0.1, d, cx, -0.05, 0, floorMat, FLOOR_TILE_M);
   // Ceiling sits one extra WALL_LIFT above the wall tops so the floor/wall
   // and wall/ceiling reveals are symmetric.
-  makeRoomBox(group, ROOM_W, 0.1, d, 0, ROOM_H + 0.05 + 2 * WALL_LIFT, 0, ceilMat);
+  makeRoomBox(group, totalW, 0.1, d, cx, ROOM_H + 0.05 + 2 * WALL_LIFT, 0, ceilMat);
 
-  // East + west walls (room-local x = ±ROOM_W/2). Small rooms have shorter
-  // side walls (d = 12) — drop their capacity to 2 so pieces aren't cramped
-  // (especially when a slot is doubled into halves).
+  // East + west walls. Small rooms have shorter side walls — drop capacity to 2.
   const sideCapacity = type === 'small' ? 2 : 3;
-  makeRoomBox(group, WALL_T, ROOM_H, d, ROOM_W / 2, ROOM_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);
-  pushAABB(ROOM_W / 2, groupZ, WALL_T, d);
+  makeRoomBox(group, WALL_T, ROOM_H, d, xPos, ROOM_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);
+  pushAABB(xPos, groupZ, WALL_T, d);
   surfaces.push({
-    position: new THREE.Vector3(ROOM_W / 2 - WALL_T / 2, ROOM_H / 2, groupZ),
+    position: new THREE.Vector3(xPos - WALL_T / 2, ROOM_H / 2, groupZ),
     normal: new THREE.Vector3(-1, 0, 0),
     width: d, height: ROOM_H, capacity: sideCapacity,
   });
-  makeRoomBox(group, WALL_T, ROOM_H, d, -ROOM_W / 2, ROOM_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);
-  pushAABB(-ROOM_W / 2, groupZ, WALL_T, d);
+  makeRoomBox(group, WALL_T, ROOM_H, d, xNeg, ROOM_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);
+  pushAABB(xNeg, groupZ, WALL_T, d);
   surfaces.push({
-    position: new THREE.Vector3(-ROOM_W / 2 + WALL_T / 2, ROOM_H / 2, groupZ),
+    position: new THREE.Vector3(xNeg + WALL_T / 2, ROOM_H / 2, groupZ),
     normal: new THREE.Vector3(+1, 0, 0),
     width: d, height: ROOM_H, capacity: sideCapacity,
   });
@@ -107,38 +118,43 @@ export function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ },
   // North/south end walls. localZ is the wall's outer face (room boundary);
   // the wall body is inset half-thickness so two adjacent rooms' walls abut
   // without overlap. sNormal points from wall into THIS room's interior.
+  // For asymmetric big rooms the door stays at x=0 but side panels differ in width.
   const addEndWall = (localZ, sNormal, hasDoor) => {
     const wallCenterZ = localZ + sNormal * (WALL_T / 2);
     const surfaceWorldZ = groupZ + wallCenterZ + sNormal * (WALL_T / 2);
     if (!hasDoor) {
-      makeRoomBox(group, ROOM_W, ROOM_H, WALL_T, 0, ROOM_H / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
-      pushAABB(0, groupZ + wallCenterZ, ROOM_W, WALL_T);
+      makeRoomBox(group, totalW, ROOM_H, WALL_T, cx, ROOM_H / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
+      pushAABB(cx, groupZ + wallCenterZ, totalW, WALL_T);
       surfaces.push({
-        position: new THREE.Vector3(0, ROOM_H / 2, surfaceWorldZ),
+        position: new THREE.Vector3(cx, ROOM_H / 2, surfaceWorldZ),
         normal: new THREE.Vector3(0, 0, sNormal),
-        width: ROOM_W, height: ROOM_H, capacity: 3,
+        width: totalW, height: ROOM_H, capacity: 3,
       });
     } else {
-      const sideW = (ROOM_W - DOOR_W) / 2;
+      // Door is always centred at x=0; panels on each side may differ in width.
+      const negPanelW = -DOOR_W / 2 - xNeg;   // width of panel on the negative-x side
+      const negPanelX = (xNeg - DOOR_W / 2) / 2;
+      const posPanelW = xPos - DOOR_W / 2;     // width of panel on the positive-x side
+      const posPanelX = (DOOR_W / 2 + xPos) / 2;
       const topH = ROOM_H - DOOR_H;
-      makeRoomBox(group, sideW, ROOM_H, WALL_T,
-        -DOOR_W / 2 - sideW / 2, ROOM_H / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
-      pushAABB(-DOOR_W / 2 - sideW / 2, groupZ + wallCenterZ, sideW, WALL_T);
-      makeRoomBox(group, sideW, ROOM_H, WALL_T,
-        +DOOR_W / 2 + sideW / 2, ROOM_H / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
-      pushAABB(+DOOR_W / 2 + sideW / 2, groupZ + wallCenterZ, sideW, WALL_T);
+      makeRoomBox(group, negPanelW, ROOM_H, WALL_T,
+        negPanelX, ROOM_H / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
+      pushAABB(negPanelX, groupZ + wallCenterZ, negPanelW, WALL_T);
+      makeRoomBox(group, posPanelW, ROOM_H, WALL_T,
+        posPanelX, ROOM_H / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
+      pushAABB(posPanelX, groupZ + wallCenterZ, posPanelW, WALL_T);
       // Transom above the doorway: no AABB — player walks under it.
       makeRoomBox(group, DOOR_W, topH, WALL_T,
         0, DOOR_H + topH / 2 + WALL_LIFT, wallCenterZ, wallMat, WALL_TILE_M);
       surfaces.push({
-        position: new THREE.Vector3(-DOOR_W / 2 - sideW / 2, ROOM_H / 2, surfaceWorldZ),
+        position: new THREE.Vector3(negPanelX, ROOM_H / 2, surfaceWorldZ),
         normal: new THREE.Vector3(0, 0, sNormal),
-        width: sideW, height: ROOM_H, capacity: 1,
+        width: negPanelW, height: ROOM_H, capacity: 1,
       });
       surfaces.push({
-        position: new THREE.Vector3(+DOOR_W / 2 + sideW / 2, ROOM_H / 2, surfaceWorldZ),
+        position: new THREE.Vector3(posPanelX, ROOM_H / 2, surfaceWorldZ),
         normal: new THREE.Vector3(0, 0, sNormal),
-        width: sideW, height: ROOM_H, capacity: 1,
+        width: posPanelW, height: ROOM_H, capacity: 1,
       });
     }
   };
@@ -149,7 +165,7 @@ export function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ },
   // Partition wall — small rooms get the wide cross partition; big rooms get
   // a side-jutting one whose side alternates by feedIdx.
   if (type === 'small') {
-    const partW = ROOM_W * 0.55;
+    const partW = ROOM_W_SMALL * 0.55;
     makeRoomBox(group, partW, PART_H, PART_T, 0, PART_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);
     pushAABB(0, groupZ, partW, PART_T);
     surfaces.push({
@@ -162,8 +178,7 @@ export function buildRoom({ type, partitionSide, openNorth, openSouth, groupZ },
     });
   } else {
     const partD = d * 0.55;
-    const xSign = partitionSide === 'right' ? +1 : -1;
-    const partX = xSign * ROOM_W * 0.18;
+    const partX = xSign * ROOM_W_SMALL * 0.18;  // fixed: stays at ±2.52 regardless of room width
     // Open face of the partition points toward the room's larger side
     const xNormal = -xSign;
     makeRoomBox(group, PART_T, PART_H, partD, partX, PART_H / 2 + WALL_LIFT, 0, wallMat, WALL_TILE_M);

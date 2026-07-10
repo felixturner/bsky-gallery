@@ -135,7 +135,7 @@ function parseFeedToMedia(feed, out, includeReposts) {
     const rkey = post.uri.split('/').pop();
     const authorHandle = post.author.handle;
     const displayName = post.author.displayName || authorHandle;
-    const postUrl = `https://bsky.app/profile/${authorHandle}/post/${rkey}`;
+    const postUrl = `https://bsky.app/profile/${post.author.did}/post/${rkey}`;
     const postText = (post.record && post.record.text) || '';
     const date = new Date(post.indexedAt).toLocaleDateString(undefined, {
       year: 'numeric', month: 'short', day: 'numeric',

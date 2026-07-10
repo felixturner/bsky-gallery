@@ -87,15 +87,11 @@ export function placePeopleInRoom(group, artworks) {
     });
     person.userData.fadeMaterials = fadeMaterials;
 
-    // The artwork stores lightAnchor (in front + above the surface) and
-    // lightTarget (the surface centre) in world coords — use them to
-    // derive the in-room "forward" direction without re-deriving normals.
-    const artPos = art.userData.lightTarget;
-    const lightAnchor = art.userData.lightAnchor;
-    const forward = new THREE.Vector3().subVectors(lightAnchor, artPos);
-    forward.y = 0;
-    if (forward.lengthSq() < 1e-6) continue;
-    forward.normalize();
+    // Use faceNormal to position the person in front of the artwork.
+    const artPos = art.getWorldPosition(new THREE.Vector3());
+    const faceNormal = art.userData.faceNormal;
+    if (!faceNormal) continue;
+    const forward = faceNormal.clone();
     const worldX = artPos.x + forward.x * PEOPLE_STANDOFF;
     const worldZ = artPos.z + forward.z * PEOPLE_STANDOFF;
     person.position.set(worldX, 0, worldZ - group.position.z);
