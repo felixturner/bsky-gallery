@@ -305,7 +305,11 @@ async function init({ items, paginator }) {
     if (!hits.length) return;
     const obj = hits[0].object;
     if (obj.userData.isPlacard) {
-      tour.goToPlacard(obj);
+      if (tour.parkedLevel === 'placard' && obj.parent === tour.parkedMesh) {
+        tour.zoomTo(tour.parkedMesh, 'near');
+      } else {
+        tour.goToPlacard(obj);
+      }
       return;
     }
     if (!obj.userData.faceNormal) return;
