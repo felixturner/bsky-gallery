@@ -65,10 +65,12 @@ function drawExternalLinkIcon(ctx, x, y, size, color) {
 }
 
 export function makePlacardTexture(item) {
+  const dpr = Math.min(window.devicePixelRatio || 1, 3);
   const canvas = document.createElement('canvas');
-  canvas.width = PLACARD_PX_W;
-  canvas.height = PLACARD_PX_H;
+  canvas.width  = PLACARD_PX_W * dpr;
+  canvas.height = PLACARD_PX_H * dpr;
   const ctx = canvas.getContext('2d');
+  ctx.scale(dpr, dpr);
 
   // Card background
   ctx.fillStyle = '#eeeeee';

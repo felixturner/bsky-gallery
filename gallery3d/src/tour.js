@@ -71,6 +71,7 @@ export function createTour({ camera, built }) {
     const rawDist = level === 'close' ? Math.min(dv, dh) : Math.max(dv, dh);
     const dist = Math.min(MAX_STANDOFF, Math.max(MIN_STANDOFF, rawDist));
     finalPos.set(wp.x + n.x * dist, wp.y, wp.z + n.z * dist);
+    built.collide?.(finalPos, PLAYER_RADIUS);
     finalLook.copy(wp);
   }
 

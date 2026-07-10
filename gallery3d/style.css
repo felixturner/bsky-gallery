@@ -217,6 +217,26 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 }
 #tap-hint[hidden] { display: none; }
 
+#mobile-exit {
+  position: fixed;
+  bottom: max(1.25rem, env(safe-area-inset-bottom));
+  right: 1.25rem;
+  padding: 0.45rem 1rem;
+  border: 1.5px solid rgba(255, 255, 255, 0.5);
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.4);
+  color: #ddd;
+  font-family: inherit;
+  font-size: 0.8rem;
+  letter-spacing: 0.04em;
+  -webkit-backdrop-filter: blur(6px);
+  backdrop-filter: blur(6px);
+  z-index: 20;
+  -webkit-tap-highlight-color: transparent;
+  cursor: pointer;
+}
+#mobile-exit[hidden] { display: none; }
+
 /* ---------- HUD when scene is active ---------- */
 #info,
 #esc-hint {

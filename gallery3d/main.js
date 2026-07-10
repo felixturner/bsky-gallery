@@ -61,6 +61,7 @@ const navControls   = document.getElementById('nav-controls');
 const navPrev       = document.getElementById('nav-prev');
 const navNext       = document.getElementById('nav-next');
 const tapHintEl     = document.getElementById('tap-hint');
+const mobileExitEl  = document.getElementById('mobile-exit');
 
 const ASSET_BASE = import.meta.env.BASE_URL; // '/' in dev, '/bsky-gallery/3d/' in prod
 const MODE = (new URL(window.location).searchParams.get('mode') || 'gallery');
@@ -286,12 +287,15 @@ async function init({ items, paginator }) {
     tourEntered = true;
     requestFullscreenOnMobile();
     fadeOverlayOut();
-    tapHintEl.hidden = false;
-    // Fade the tap hint out after a few seconds once they've had a look.
-    setTimeout(() => { tapHintEl.style.opacity = '0'; }, 4500);
+    tapHintEl.hidden = true;
+    if (USE_TOUR) mobileExitEl.hidden = false;
     if (toggles.sound) ambienceAudio.play().catch(() => {});
     tour.enter(); // frame the nearest piece so there's an initial subject
   }
+
+  mobileExitEl.addEventListener('click', () => {
+    try { document.exitFullscreen?.() ?? document.webkitExitFullscreen?.(); } catch {}
+  });
 
   // Tap a picture → walk to it. Raycast from the tap point; a placard hit
   // resolves to its parent artwork. Ignored mid-walk so taps don't queue.
@@ -443,7 +447,7 @@ async function init({ items, paginator }) {
       if (keys.s) controls.moveForward(-speed);
       if (keys.a) controls.moveRight(-speed);
       if (keys.d) controls.moveRight(speed);
-      if (MODE === 'gallery') built.collide?.(camera.position, 0.3);
+      if (MODE === 'gallery' && !USE_TOUR) built.collide?.(camera.position, 0.3);
     }
     if (MODE === 'gallery') {
       built.update?.(dt, camera);

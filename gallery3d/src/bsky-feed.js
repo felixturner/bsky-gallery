@@ -260,11 +260,11 @@ function createListPaginator(listUri, { includeReposts }) {
     if (states.length === 0) allExhausted = true;
   }
 
-  async function fetchAuthorPage(s) {
+  async function fetchAuthorPage(s, limit = 100) {
     if (s.exhausted) return [];
     const url = new URL(`${XRPC}/app.bsky.feed.getAuthorFeed`);
     url.searchParams.set('actor', s.did);
-    url.searchParams.set('limit', 100);
+    url.searchParams.set('limit', limit);
     if (s.cursor) url.searchParams.set('cursor', s.cursor);
     try {
       const res = await fetch(url);
@@ -290,7 +290,7 @@ function createListPaginator(listUri, { includeReposts }) {
     // member 0, then 100 from member 1, etc.
     if (!initialized) {
       initialized = true;
-      const results = await Promise.all(states.map(fetchAuthorPage));
+      const results = await Promise.all(states.map((s) => fetchAuthorPage(s, 10)));
       allExhausted = states.every((s) => s.exhausted);
       return shuffleInPlace([].concat(...results));
     }
